@@ -25,7 +25,7 @@ class Ui_ConfigWindow(object):
         if not ConfigWindow.objectName():
             ConfigWindow.setObjectName(u"ConfigWindow")
         ConfigWindow.setWindowModality(Qt.WindowModality.NonModal)
-        ConfigWindow.resize(569, 348)
+        ConfigWindow.resize(569, 407)
         sizePolicy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         sizePolicy.setHorizontalStretch(0)
         sizePolicy.setVerticalStretch(0)
@@ -248,8 +248,8 @@ class Ui_ConfigWindow(object):
 
         self.verticalLayout.addWidget(self.ch_lbl)
 
-        self.horizontalLayout_3 = QHBoxLayout()
-        self.horizontalLayout_3.setObjectName(u"horizontalLayout_3")
+        self.ch_hlay = QHBoxLayout()
+        self.ch_hlay.setObjectName(u"ch_hlay")
         self.ch1_radio = QRadioButton(self.centralwidget)
         self.ch1_radio.setObjectName(u"ch1_radio")
         sizePolicy3.setHeightForWidth(self.ch1_radio.sizePolicy().hasHeightForWidth())
@@ -257,7 +257,7 @@ class Ui_ConfigWindow(object):
         self.ch1_radio.setChecked(True)
         self.ch1_radio.setAutoExclusive(False)
 
-        self.horizontalLayout_3.addWidget(self.ch1_radio)
+        self.ch_hlay.addWidget(self.ch1_radio)
 
         self.ch2_radio = QRadioButton(self.centralwidget)
         self.ch2_radio.setObjectName(u"ch2_radio")
@@ -265,7 +265,7 @@ class Ui_ConfigWindow(object):
         self.ch2_radio.setSizePolicy(sizePolicy3)
         self.ch2_radio.setAutoExclusive(False)
 
-        self.horizontalLayout_3.addWidget(self.ch2_radio)
+        self.ch_hlay.addWidget(self.ch2_radio)
 
         self.ch3_radio = QRadioButton(self.centralwidget)
         self.ch3_radio.setObjectName(u"ch3_radio")
@@ -273,7 +273,7 @@ class Ui_ConfigWindow(object):
         self.ch3_radio.setSizePolicy(sizePolicy3)
         self.ch3_radio.setAutoExclusive(False)
 
-        self.horizontalLayout_3.addWidget(self.ch3_radio)
+        self.ch_hlay.addWidget(self.ch3_radio)
 
         self.ch4_radio = QRadioButton(self.centralwidget)
         self.ch4_radio.setObjectName(u"ch4_radio")
@@ -281,10 +281,61 @@ class Ui_ConfigWindow(object):
         self.ch4_radio.setSizePolicy(sizePolicy3)
         self.ch4_radio.setAutoExclusive(False)
 
-        self.horizontalLayout_3.addWidget(self.ch4_radio)
+        self.ch_hlay.addWidget(self.ch4_radio)
 
 
-        self.verticalLayout.addLayout(self.horizontalLayout_3)
+        self.verticalLayout.addLayout(self.ch_hlay)
+
+        self.verticalSpacer_3 = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
+
+        self.verticalLayout.addItem(self.verticalSpacer_3)
+
+        self.t_lbl = QLabel(self.centralwidget)
+        self.t_lbl.setObjectName(u"t_lbl")
+        self.t_lbl.setEnabled(False)
+
+        self.verticalLayout.addWidget(self.t_lbl)
+
+        self.t_hlay = QHBoxLayout()
+        self.t_hlay.setObjectName(u"t_hlay")
+        self.t0_radio = QRadioButton(self.centralwidget)
+        self.t0_radio.setObjectName(u"t0_radio")
+        self.t0_radio.setEnabled(False)
+        sizePolicy3.setHeightForWidth(self.t0_radio.sizePolicy().hasHeightForWidth())
+        self.t0_radio.setSizePolicy(sizePolicy3)
+        self.t0_radio.setAutoExclusive(False)
+
+        self.t_hlay.addWidget(self.t0_radio)
+
+        self.t1_radio = QRadioButton(self.centralwidget)
+        self.t1_radio.setObjectName(u"t1_radio")
+        self.t1_radio.setEnabled(False)
+        sizePolicy3.setHeightForWidth(self.t1_radio.sizePolicy().hasHeightForWidth())
+        self.t1_radio.setSizePolicy(sizePolicy3)
+        self.t1_radio.setAutoExclusive(False)
+
+        self.t_hlay.addWidget(self.t1_radio)
+
+        self.t2_radio = QRadioButton(self.centralwidget)
+        self.t2_radio.setObjectName(u"t2_radio")
+        self.t2_radio.setEnabled(False)
+        sizePolicy3.setHeightForWidth(self.t2_radio.sizePolicy().hasHeightForWidth())
+        self.t2_radio.setSizePolicy(sizePolicy3)
+        self.t2_radio.setAutoExclusive(False)
+
+        self.t_hlay.addWidget(self.t2_radio)
+
+        self.t3_radio = QRadioButton(self.centralwidget)
+        self.t3_radio.setObjectName(u"t3_radio")
+        self.t3_radio.setEnabled(False)
+        sizePolicy3.setHeightForWidth(self.t3_radio.sizePolicy().hasHeightForWidth())
+        self.t3_radio.setSizePolicy(sizePolicy3)
+        self.t3_radio.setAutoExclusive(False)
+
+        self.t_hlay.addWidget(self.t3_radio)
+
+
+        self.verticalLayout.addLayout(self.t_hlay)
 
         self.verticalSpacer = QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
 
@@ -294,7 +345,7 @@ class Ui_ConfigWindow(object):
         self.iniciar_hlay.setSpacing(10)
         self.iniciar_hlay.setObjectName(u"iniciar_hlay")
         self.iniciar_hlay.setSizeConstraint(QLayout.SizeConstraint.SetDefaultConstraint)
-        self.iniciar_hlay.setContentsMargins(-1, 30, -1, 5)
+        self.iniciar_hlay.setContentsMargins(-1, 0, -1, 5)
         self.horizontalSpacer = QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
 
         self.iniciar_hlay.addItem(self.horizontalSpacer)
@@ -346,6 +397,11 @@ class Ui_ConfigWindow(object):
         self.ch2_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 2", None))
         self.ch3_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 3", None))
         self.ch4_radio.setText(QCoreApplication.translate("ConfigWindow", u"Canal 4", None))
+        self.t_lbl.setText(QCoreApplication.translate("ConfigWindow", u"Traces usados:", None))
+        self.t0_radio.setText(QCoreApplication.translate("ConfigWindow", u"Trace 0", None))
+        self.t1_radio.setText(QCoreApplication.translate("ConfigWindow", u"Trace 1", None))
+        self.t2_radio.setText(QCoreApplication.translate("ConfigWindow", u"Trace 2", None))
+        self.t3_radio.setText(QCoreApplication.translate("ConfigWindow", u"Trace 3", None))
         self.start_btn.setText(QCoreApplication.translate("ConfigWindow", u"Iniciar an\u00e1lise", None))
     # retranslateUi
 

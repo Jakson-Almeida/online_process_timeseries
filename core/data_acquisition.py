@@ -20,12 +20,15 @@ class DataAcquisition(QObject):
         switch_ports (list[str], opcional): Lista de portas dos switches Sercalo (se detectados) - pode haver múltiplos.
 
     """
-    # Sinal para indicar que novos dados foram adquiridos
-    data_acquired = Signal(list, str, int)  # spectrum, warn, channel
+    # Sinal para indicar que novos dados foram adquiridos.
+    # Usa object para evitar conversões rígidas C++.
+    data_acquired = Signal(object, object, int) # spectrum, warn, channel
     # Sinal para indicar que a aquisição foi finalizada
     finished = Signal()
     # Sinal para indicar erro (para mostrar mensagem na thread principal)
     error_occurred = Signal(str, str)  # title, message
+    # Sinal para iniciar a thread de aquisição após a configuração ocorrer sem erros
+    start_thread = Signal()
 
     def __init__(self, inter: str, ip: str, port: str, osa, switch_ports: list[str] | None = None):
         super().__init__()
@@ -96,6 +99,7 @@ class DataAcquisition(QObject):
             self.finished.emit()
             self.device = None
             return
+        self.start_thread.emit()
 
     def stop(self):
         """
@@ -127,7 +131,7 @@ class DataAcquisition(QObject):
             logger.error(f"Erro ao fechar dispositivo: {e}")
         self.finished.emit()
 
-    def request_data(self, n_mean: int, channel: int, bragg_channel: int=0):
+    def request_data(self, n_mean: int, channel: int, bragg_traces: list[bool]):
         """
         Solicita um novo conjunto de dados do dispositivo.
         
@@ -136,8 +140,7 @@ class DataAcquisition(QObject):
         
         Args:
             n_mean (int): Número de amostras para média espectral.
-            channel (int): Canal a ser lido (apenas para BraggMeter).
-            bragg_channel (int): Canal do BraggMeter a ser lido.
+            channel (int): Canal a ser lido do switch.
         """
         if self._stopping:
             return
@@ -158,12 +161,14 @@ class DataAcquisition(QObject):
             if switch is not None:
                 # Em modo contínuo (OSA203), apenas sincroniza sem pausas
                 if self._continuous_mode:
-                    # Notifica dispositivo sobre mudança de canal para sincronização
-                    device.set_channel_info(channel)
+                    # Para evitar espectros mistos, a troca de canal acontece
+                    # com a aquisição contínua completamente parada.
+                    device.stop_continuous_acquisition()
 
                     # Em modo contínuo, ainda validamos que os dois switches
-                    # chegaram ao mesmo canal antes de consumir o espectro.
+                    # chegaram ao mesmo canal antes de reiniciar a leitura.
                     max_retries = 3
+                    current_channel = -1
                     for _ in range(max_retries):
                         switch.set_channel(channel)
                         try:
@@ -179,37 +184,36 @@ class DataAcquisition(QObject):
                             f"Falha ao sincronizar canal {channel} em todos os switches Sercalo."
                         )
 
-                    device.flush_continuous_readout()
+                    # Reinicia a aquisição apenas depois da confirmação total
+                    # da troca de canal.
+                    device.start_continuous_acquisition(spectrum_averaging=self._spectrum_averaging)
+                    device.set_channel_info(channel)
                 else:
-                    # Modo padrão (não contínuo): aguarda switch estar stável
+                    # Modo padrão (não contínuo): aguarda switch estar estável
                     switch.set_channel(channel)
                     time.sleep(0.05)
                     # Valida que todos os switches foram alterados corretamente
                     max_retries = 3
                     cur_channel = -1
                     for _ in range(max_retries):
-                        if switch is not None:
-                            cur_channel = switch.get_channel()
-                            if cur_channel == channel:
-                                break                        
-                            else:
-                                switch.set_channel(channel)
-                
-                    if cur_channel != channel and switch is not None:
+                        cur_channel = switch.get_channel()
+                        if cur_channel == channel:
+                            break
+                        switch.set_channel(channel)
+
+                    if cur_channel != channel:
                         raise Exception(f"Falha ao configurar canal {channel} em todos os switches Sercalo.")
-                
-            bragg = bool(('BRAGGMETER') in self.inter)
-            spectrum, warn = device.get_osa_trace(n_mean, bragg_channel if bragg else int(channel))
-            if spectrum is not None and not self._stopping:
-                emitted_channel = int(channel)
-                if switch is None and bragg:
-                    emitted_channel = int(bragg_channel)
-                self.data_acquired.emit(spectrum, warn, emitted_channel)
-            elif spectrum is None and self._paused:
-                # Silent return if paused - this is expected behavior during pause
-                return
-            elif spectrum is None:
+
+            spectrum, warn = device.get_osa_trace(n_mean, bragg_traces)
+            if spectrum is None:
+                if self._paused:
+                    # Silent return if paused - this is expected behavior during pause
+                    return
                 logger.debug("Espectro vazio retornado (pode estar pausado ou desconectado).")
+                self.data_acquired.emit([], warn, channel)
+
+            if not self._stopping:
+                self.data_acquired.emit(spectrum, warn, channel)
         except SerialException as e:
             if self._stopping:
                 return
@@ -248,7 +252,7 @@ class DataAcquisition(QObject):
             return
 
         try:
-            spectrum, warn = device.get__multiple_osa_traces(n)
+            spectrum, warn = device.get_multiple_osa_traces(n)
             if spectrum is not None and not self._stopping:
                 self.data_acquired.emit(spectrum, warn, 0)
             elif spectrum is None and self._paused:

@@ -90,7 +90,16 @@ class BraggMeter:
         self.timeout = 5
         self.sock = None
 
+        self.open()
+        time.sleep(0.05)
         self.start()
+        time.sleep(0.05)
+
+    def __del__(self):
+        """
+        Destructor for the BraggMeter class. Ensures that the socket connection is closed when the object is destroyed.
+        """
+        self.close()
 
     def close(self):
         """
@@ -130,11 +139,11 @@ class BraggMeter:
                 self.sock = None
                 if attempt < 2:
                     logger.warning(
-                        f'Failed to open socket to {self.host}:{self.port} on attempt {attempt + 1}/3: {e}. Retrying...')
+                        f'Failed to open socket to {self.host}:{self.port} on attempt {attempt + 1}/2: {e}. Retrying...')
                     time.sleep(0.1)
                 else:
                     logger.error(f'Failed to open socket to {self.host}:{self.port}: {e}')
-                    raise ConnectionError(f'Failed to open socket: {e}') from e
+                    raise ConnectionError(f'Failed to open socket: {e}')
 
     def ask(self, key):
         """
@@ -151,6 +160,20 @@ class BraggMeter:
         resp = self.send(string)
         return resp
 
+    def flush(self, sock, timeout=0.01):
+        sock.setblocking(False)
+        start = time.time()
+        try:
+            while time.time() - start < timeout:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                except BlockingIOError:
+                    time.sleep(0.001)
+        finally:
+            sock.setblocking(True)
+
     def send(self, string, retries=0):
         """
         Assure a socket connection to the BraggMeter device, sends a command, and returns the response.
@@ -163,8 +186,8 @@ class BraggMeter:
             str: The response from the BraggMeter device.
 
         """
-        self.open()
         try:
+            self.flush(self.sock)
             self.sock.sendall(string)
             resp = b''
             while True:
@@ -179,8 +202,8 @@ class BraggMeter:
             logger.error(f'Socket error: {e}. Retrying...')
             if retries > 2: # 3 attempts total
                 raise ConnectionError(f'Max retries exceeded: {e}')
+            self.open()
             return self.send(string, retries=retries+1)
-        self.close()
         return resp
 
     def start(self):
@@ -189,14 +212,13 @@ class BraggMeter:
 
         """
         status = self.get_status()
-        logger.info(f'BraggMETER status: {status}')
         if status == 1:
             self.ask('start')
         elif status == 3 or status == 4:
             self.ask('stop')
             self.ask('start')
         elif status == 5:
-            err_msg = 'BraggMETER em aquecimento'
+            err_msg = 'BraggMeter em aquecimento.'
             logger.error(err_msg)
             raise RuntimeError(err_msg)
 
@@ -208,12 +230,9 @@ class BraggMeter:
             str: The response from the BraggMeter device.
 
         """
-        status = self.get_status()
-        logger.debug(f'BraggMETER status before stopping: {status}')
-        
         resp = self.ask('stop')
         status = self.get_status()
-        logger.info(f'BraggMETER status: {status}')
+        logger.info(f'BraggMeter status: {status}')
 
         return resp
 
@@ -234,79 +253,115 @@ class BraggMeter:
                 loc = i + 1
         return int(resp[loc])
 
-    def get_osa_trace(self, _, channel: int=0):
+    def get_osa_trace(self, n_mean: int, bragg_traces: list[bool], *args):
         """
         Retrieves the OSA trace data from the specified channel.
 
         Args:
             n_mean (int): The number of samples to average.
-            channel (int): The channel number.
+            bragg_traces (list[bool]): A list indicating which Bragg traces to include.
 
         Returns:
-            numpy.ndarray: An array containing the wavelength and trace data.
+            numpy.ndarray: An array containing the wavelength and trace data.  
             str: An warning message if the spectrum is saturated, otherwise None.
         """
-        warn = None
+
+        traces = [i for i, include in enumerate(bragg_traces) if include]
         try:
-            resp = self.ask(f'trace{channel}')
-            if not resp:
-                logger.debug('Empty response from BraggMeter for trace request')
-                return None, None
+            warn = []
+            trace_wavelengths = []
+            trace_powers = []
+            spectrum = []
+            
+            for trace in traces:
+                warn_raw = False
+                wl_raw = []
+                power_raw = []
+                spec_count = 0
 
-            # Try to isolate payload after ACK if present
-            ack_idx = resp.find('ACK')
-            payload = resp[ack_idx+4:] if ack_idx != -1 else resp
-            payload = payload.strip().strip('\r\n')
+                while spec_count < n_mean:
+                    for retry in range(5):
+                        resp = self.ask(f'trace{trace}')
+                        if resp:
+                            break
+                        self.open()
+                        time.sleep(0.02)
+                    else:
+                        raise ConnectionError(f'No response received for trace{trace} after 5 attempts.')
 
-            parts = payload.split(':')
+                    # Try to isolate payload after ACK if present
+                    ack_idx = resp.find('ACK')
+                    payload = resp[ack_idx+4:] if ack_idx != -1 else resp
+                    payload = payload.strip().strip('\r\n')
 
-            if self.legacy_cmds:
-                pot = parts[-1] if parts else ''
-                # legacy pot is comma separated numeric values
-                trace_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', pot)
-                trace_raw = np.array([float(x) for x in trace_vals], dtype=float)
-                wl = np.linspace(1500, 1600, len(trace_raw))
-            else:
-                if len(parts) < 2:
-                    logger.debug('Incomplete response from BraggMeter (no data/wavelength part)')
-                    return None, None
-                pot, wl_str = parts[-2], parts[-1]
-                # remove any non-hex characters and join contiguous hex chunks
-                hex_chunks = re.findall(r'[0-9A-Fa-f]+', pot)
-                pot_hex = ''.join(hex_chunks)
-                # split into 3-char hex words
-                hex_values = [pot_hex[i:i+3] for i in range(0, len(pot_hex), 3) if pot_hex[i:i+3]]
-                if not hex_values:
-                    logger.debug('No hex values parsed from BraggMeter response')
-                    return None, None
-                try:
-                    trace_raw = np.array([int(hv, 16) for hv in hex_values], dtype=float)
-                except ValueError:
-                    logger.debug('Invalid hex values in BraggMeter response')
-                    return None, None
-                wl_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', wl_str)
-                wl = np.array([float(x) for x in wl_vals], dtype=float)
+                    if self.legacy_cmds:
+                        parts = payload
+                        pot = parts[-1] if parts else ''
+                        # legacy pot is comma separated numeric values
+                        trace_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', pot)
+                        try:
+                            power_raw.append(np.array([float(x) for x in trace_vals], dtype=float))
+                        except ValueError:
+                            logger.debug('Invalid float values in BraggMeter response')
+                            continue
+                        wl_raw.append(np.linspace(1500, 1600, len(power_raw[-1])))
+                    else:
+                        parts = payload.split(':')
+                        if len(parts) < 2:
+                            logger.debug('Incomplete response from BraggMeter (no data/wavelength part)')
+                            return None, None
+                        pot, wl_str = parts[-2], parts[-1]
+                        # remove any non-hex characters and join contiguous hex chunks
+                        hex_chunks = re.findall(r'[0-9A-Fa-f]+', pot)
+                        pot_hex = ''.join(hex_chunks)
+                        # split into 3-char hex words
+                        hex_values = [pot_hex[i:i+3] for i in range(0, len(pot_hex), 3) if pot_hex[i:i+3]]
+                        if not hex_values:
+                            logger.debug('No hex values parsed from BraggMeter response')
+                            return None, None
+                        try:
+                            power_raw.append(np.array([int(hv, 16) for hv in hex_values], dtype=float))
+                        except ValueError:
+                            logger.debug('Invalid hex values in BraggMeter response')
+                            return None, None
+                        wl_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', wl_str)
+                        wl_raw.append(np.array([float(x) for x in wl_vals], dtype=float))
 
-            if trace_raw.size == 0 or wl.size == 0:
-                logger.debug('Parsed empty wavelength or trace from BraggMeter')
-                return None, None
+                    if len(power_raw[-1]) == 0 or len(wl_raw[-1]) == 0:
+                        logger.debug('Parsed empty wavelength or trace from BraggMeter')
+                        return None, None
 
-            # Ensure both arrays have the same dimension by truncating to the smaller
-            min_len = min(len(wl), len(trace_raw))
-            if len(wl) != len(trace_raw):
-                logger.warning(f'Wavelength and trace length mismatch (wl={len(wl)}, trace={len(trace_raw)}). Truncating to {min_len}.')
-            wl = wl[:min_len]
-            trace_raw = trace_raw[:min_len]
+                    # Ensure both arrays have the same dimension by truncating to the smaller
+                    min_len = min(
+                        min(len(w) for w in wl_raw),
+                        min(len(p) for p in power_raw)
+                    )
 
-            if np.max(trace_raw) == 4095:
-                warn = "Optical connector saturated."
+                    for i, (w, p) in enumerate(zip(wl_raw, power_raw)):
+                        if len(w) != min_len or len(p) != min_len:
+                            logger.debug(f'Wavelength and trace length mismatch (wl={len(wl_raw[-1])},' 
+                                         f'trace={len(power_raw[-1])}). Truncating to {min_len}.')
 
-            spec = np.stack((wl, trace_raw), axis=1)
-            spec = np.flipud(spec)
-            return spec, warn
+                    wl_raw = [w[:min_len] for w in wl_raw]
+                    power_raw = [p[:min_len] for p in power_raw]
+
+                    warn_raw = bool(np.max(power_raw[-1]) == 4095) or warn_raw
+                    
+                    spec_count += 1
+                    time.sleep(0.02)
+
+                trace_wavelengths.append(np.mean(wl_raw, axis=0))
+                trace_powers.append(np.mean(power_raw, axis=0))
+                warn.append(warn_raw)
+
+            for i in range(len(traces)):
+                spec = np.stack((trace_wavelengths[i], trace_powers[i]), axis=1)
+                spectrum.append(np.flipud(spec))
+            return spectrum, warn
+    
         except Exception as e:
-            logger.error(f'Erro ao ler trace do BraggMeter: {e}', exc_info=True)
-            return None, None
+            logger.error(f'Error reading trace from BraggMeter: {e}')
+            raise e
 
     def get_peaks(self, channel):
         """
@@ -325,7 +380,7 @@ class BraggMeter:
         try:
             lambdas = self.ask(f'power{channel}')
         except Exception as e:
-            logger.error(f'Erro ao ler intensidade do Bragg: {e}')
+            logger.error(f'Error reading power from BraggMeter: {e}')
             self.start()
             lambdas = self.ask(f'power{channel}')
         i = lambdas.find('ACK') + 4
@@ -353,7 +408,7 @@ class BraggMeter:
         try:
             lambdas = self.ask(f'bragg{channel}')
         except Exception as e:
-            logger.error(f'Erro ao ler intensidade do Bragg: {e}')
+            logger.error(f'Error reading bragg from BraggMeter: {e}')
             self.start()
             lambdas = self.ask(f'bragg{channel}')
         i = lambdas.find('ACK') + 4
@@ -728,7 +783,6 @@ class Imon512:
                 logger.error('Serial port or internal objects became invalid during measurement')
         self.ask('esc')
         measurements = np.array(measurements, dtype=float)
-        
         if return_single:
             spectrum = np.stack((self.wl[1::], np.mean(measurements, axis=0)), axis=1)
             return np.flipud(spectrum), warn

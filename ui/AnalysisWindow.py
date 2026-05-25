@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (QMainWindow, QMessageBox, QGraphicsRectItem, QInputDialog, QDialog, QPushButton, 
-    QMenu, QApplication, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCompleter)
+    QMenu, QApplication, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCompleter, QTabWidget, QWidget, QVBoxLayout)
 from PySide6.QtGui import QColor, QLinearGradient, QBrush, QIcon, QPalette, QGradient
 from PySide6.QtCore import Signal, QThread, QTimer, Qt, QLocale, QSettings
 
@@ -36,7 +36,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
     """
     # Sinal para indicar à ConfigWindow que esta janela está sendo fechada
     closing = Signal(str)
-    request_data_signal = Signal(int, int, int)
+    request_data_signal = Signal(int, int, object) # (mean_samples, channel, bragg_traces)
     stop_worker_signal = Signal()
 
     def __init__(self):
@@ -68,6 +68,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Rastreador de cores para picos FBG: mapeia wavelength (em metros) para cor
         # Garante que o mesmo pico mantém a mesma cor ao longo do tempo
         self.fbg_peak_color_map: dict[float, tuple] = {}
+        # Número máximo de entradas no mapa de cores; evita crescimento ilimitado
+        # com drift de picos ao longo de horas de operação.
+        self._MAX_PEAK_COLORS: int = 64
+        # Referências directas às InfiniteLines actuais no spectraPlotWidget;
+        # evita iterar sobre todos os items do plot para removê-las.
+        self._peak_marker_lines: list = []
         # Comprimentos de onda fixos para interpolação (em metros)
         self.fixed_wavelengths: np.ndarray | None = None
         # Dicionário de listas para armazenar os resultados processados
@@ -78,8 +84,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.exposure_time: float = 0.0
         # Intervalo entre amostras (ms)
         self.sample_rate: int = 0
-        # Duração da amostra contínua (s)
-        self.sample_duration: int | None = None
         # Nome da amostra contínua
         self.sample_name: str | None = None
         # Timer para parar a aquisição contínua
@@ -127,6 +131,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.active_channel_idx: int = 0
         # Lista dos canais habilitados para aquisição cíclica
         self.enabled_channels: list[int] = []
+        # Índice da aba trace atualmente em exibição
+        self.in_view_trace: int | None = None
 
         # Método de janela aplicado no plot (None desabilita)
         self.window: str | None = None
@@ -162,11 +168,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.timer: QTimer | None = None
         self._cycle_started_at: float | None = None
         self._cycle_pending_responses: int = 0
+        self._cycle_channels: list[int] = []
+        self._cycle_channel_index: int = 0
         # Flag para evitar chamadas concorrentes de _cleanup_thread
         self._is_stopping = False
         
         # Instância compartilhada de PyCCT/OSA para evitar conflito de múltiplas instâncias
         self.osa = None
+        # Marca que a última falha foi de comunicação e o handle compartilhado precisa ser recriado
+        self._connection_lost = False
         # Configurações persistentes da janela de análise
         self.settings = QSettings('LiTel', 'online_process_timeseries')
 
@@ -617,6 +627,81 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             return 'INT'
         return fiber
 
+    def _default_trace_state(self, trace_number: int) -> dict:
+        """Retorna o estado padrão de um trace do BraggMeter."""
+        return {
+            'spectra_data': None,
+            'roi_range': None,
+            'temporal_roi_range': None,
+            'results_df': self._empty_result_store(),
+            'samples': {},
+            'pending_hdf5': self._empty_result_store(),
+            'fixed_traces': {},
+            'active_traces': [],
+            'error_messages': [],
+            'warnings': [],
+            'add_legend': True,
+            'in_view_trace': trace_number,
+        }
+
+    def _is_braggmeter(self) -> bool:
+        """ 
+        Returns:
+            bool: True se a interface for um BraggMeter, False caso contrário.
+
+        """
+        inter = self.config_data.get('inter')
+        return 'BRAGGMETER' in inter
+
+    def _active_bragg_traces(self) -> list[int]:
+        """
+        Returns:
+            list[int]: Lista de índices dos traces ativos do BraggMeter.
+        
+        """
+        trace = []
+        for i, t in enumerate(self.config_data.get('bragg_traces')):
+            if t:
+                trace.append(i)
+        return trace
+
+    def _apply_state_snapshot(self, state: dict, sync_regions: bool = True):
+        """Aplica um snapshot de estado aos atributos da janela sem trocar de aba."""
+        self.spectra_data = state['spectra_data']
+        self.roi_range = state['roi_range']
+        temporal_roi_range = state.get('temporal_roi_range')
+        self.results_df = state['results_df']
+        self.results_df.setdefault('Vale', [])
+        self.results_df.setdefault('Picos', [])
+        self.samples = state['samples']
+        self.pending_hdf5 = state['pending_hdf5']
+        self.pending_hdf5.setdefault('Vale', [])
+        self.pending_hdf5.setdefault('Picos', [])
+        self.fixed_traces = state['fixed_traces']
+        self.active_traces = state['active_traces']
+        self.error_messages = state['error_messages']
+        self.in_view_trace = state.get('in_view_trace')
+
+        if self.roi_range is not None:
+            if sync_regions:
+                self.roi_region.setRegion(self.roi_range)
+            else:
+                self.roi_region.blockSignals(True)
+                try:
+                    self.roi_region.setRegion(self.roi_range)
+                finally:
+                    self.roi_region.blockSignals(False)
+
+        if temporal_roi_range is not None:
+            if sync_regions:
+                self.temporal_roi_region.setRegion(temporal_roi_range)
+            else:
+                self.temporal_roi_region.blockSignals(True)
+                try:
+                    self.temporal_roi_region.setRegion(temporal_roi_range)
+                finally:
+                    self.temporal_roi_region.blockSignals(False)
+
     def _result_key(self) -> str:
         """
         Returns:
@@ -712,6 +797,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         min_relative_recurrence: float = 0.25,
         max_allowed_jump_factor: float = 2.5,
         max_irregular_jump_ratio: float = 0.35,
+        expected_jump: float | None = None,
     ) -> bool:
         """
         Valida se um grupo de pico é recorrente e temporalmente consistente.
@@ -725,6 +811,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             - min_relative_recurrence: Recorrência relativa mínima.
             - max_allowed_jump_factor: Fator máximo de salto permitido.
             - max_irregular_jump_ratio: Proporção máxima de saltos irregulares.
+            - expected_jump: Mediana dos saltos temporais globais pré-calculada pelo chamador.
+              Quando fornecida, evita recalcular np.diff(all_timestamps) para cada grupo.
         Returns:
             bool: True se o grupo for temporalmente consistente, False caso contrário.
 
@@ -742,13 +830,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         if group_count < 3:
             return True
 
-        ts_all = np.asarray(all_timestamps, dtype=float)
-        global_jumps = np.diff(ts_all)
-        global_jumps = global_jumps[global_jumps > 0]
-        if global_jumps.size == 0:
-            return True
+        # Usa o expected_jump pré-calculado quando disponível; caso contrário deriva dos timestamps.
+        if expected_jump is None:
+            ts_all = np.asarray(all_timestamps, dtype=float)
+            global_jumps = np.diff(ts_all)
+            global_jumps = global_jumps[global_jumps > 0]
+            if global_jumps.size == 0:
+                return True
+            expected_jump = float(np.median(global_jumps))
 
-        expected_jump = float(np.median(global_jumps))
         if expected_jump <= 0:
             return True
 
@@ -776,12 +866,30 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             dict: {wavelength_referencia: [(timestamp, wavelength), ...]}
 
         """
+        # Limita o histórico analisado ao teto de memória do results_df para manter
+        # _group_fbg_peak_series em O(max_live_points) independentemente da duração da sessão.
+        limit = self.max_live_points
+        if len(timestamps) > limit:
+            timestamps  = timestamps[-limit:]
+            peak_series = peak_series[-limit:]
+
         grouped = self._group_fbg_peak_series(timestamps, peak_series)
+
+        # Calcula expected_jump uma única vez para todos os grupos, evitando refazer
+        # np.diff(all_timestamps) dentro de _is_temporally_consistent_peak_group a cada grupo.
+        if timestamps:
+            ts_all = np.asarray(timestamps, dtype=float)
+            global_jumps = np.diff(ts_all)
+            global_jumps = global_jumps[global_jumps > 0]
+            expected_jump: float | None = float(np.median(global_jumps)) if global_jumps.size > 0 else None
+        else:
+            expected_jump = None
+
         filtered = {}
         for wl, points in grouped.items():
             if len(points) < min_count:
                 continue
-            if not self._is_temporally_consistent_peak_group(points, timestamps):
+            if not self._is_temporally_consistent_peak_group(points, timestamps, expected_jump=expected_jump):
                 continue
             filtered[wl] = points
         return filtered
@@ -843,7 +951,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 return self.fbg_peak_color_map[matching_wl]
 
         # Caso contrário — ou não encontrou match, ou a chave já foi usada
-        # — cria um novo mapeamento persistente para este wavelength e retorna
+        # — cria um novo mapeamento persistente para este wavelength e retorna.
+        # Antes de inserir, descarta a entrada mais antiga se o mapa estiver cheio;
+        # impede crescimento ilimitado causado por drift de picos ao longo de horas.
+        if len(self.fbg_peak_color_map) >= self._MAX_PEAK_COLORS:
+            oldest_key = next(iter(self.fbg_peak_color_map))
+            del self.fbg_peak_color_map[oldest_key]
         peak_count = len(self.fbg_peak_color_map)
         max_peaks = max(peak_count + 1, 3)
         new_color = pg.intColor(peak_count, hues=max_peaks)
@@ -876,6 +989,43 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.roi_range = None
             self._clear_fbg_peak_colors()  # Limpa mapa de cores ao mudar para modo com séries recorrentes
 
+    def _style_merge_plot_specs(self, plot_specs: list[tuple[object, object | None]]):
+        """Aplica a paleta atual a um grupo de widgets de merge."""
+        for plot_widget, _ in plot_specs:
+            if plot_widget is None:
+                continue
+            plot_widget.setBackground(self.theme_colors['plot_bg'])
+            item = plot_widget.getPlotItem()
+            item.getAxis('left').setPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('left').setTextPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('bottom').setPen(pg.mkPen(self.theme_colors['axis']))
+            item.getAxis('bottom').setTextPen(pg.mkPen(self.theme_colors['axis']))
+
+    def _set_merge_axis_unit_for_specs(self, plot_specs: list[tuple[object, object | None]]):
+        """Atualiza os eixos X de um grupo de widgets de merge conforme a unidade atual."""
+        unit_label = {
+            'm': 'm',
+            'um': 'μm',
+            'nm': 'nm',
+            'pm': 'pm',
+        }.get(self.xUnit, 'nm')
+
+        for idx, (plot_widget, _) in enumerate(plot_specs):
+            if plot_widget is None:
+                continue
+            if idx == 0:
+                plot_widget.setLabel('left', 'Potência', units='dBm')
+            else:
+                plot_widget.setLabel('left', '')
+            plot_widget.showGrid(x=(idx == 0), y=(idx == 0))
+            bottom_axis = pg.AxisItem(orientation='bottom')
+            if idx == 0:
+                bottom_axis.setLabel(text='Comprimento de Onda', units=unit_label)
+            else:
+                bottom_axis.setLabel(text='')
+            bottom_axis.enableAutoSIPrefix(False)
+            plot_widget.setAxisItems({'bottom': bottom_axis})
+
     def _setup_merge_plots(self):
         """
         Configura os widgets da tab Merge com a mesma base visual dos demais widgets.
@@ -889,41 +1039,90 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             (self.mergeCh4PlotWidget, None),
         ]
 
-        self._set_merge_axis_unit()
+        self.bragg_merge_plot_specs = [
+            (getattr(self, 'braggMergePlotWidget', None), getattr(self, 'braggMergePlotWidget', None).addLegend() if getattr(self, 'braggMergePlotWidget', None) is not None else None),
+            (getattr(self, 'mergeT0PlotWidget', None), None),
+            (getattr(self, 'mergeT1PlotWidget', None), None),
+            (getattr(self, 'mergeT2PlotWidget', None), None),
+            (getattr(self, 'mergeT3PlotWidget', None), None),
+        ]
 
-        for plot_widget, _ in self.merge_plot_specs:
-            plot_widget.setBackground(self.theme_colors['plot_bg'])
-            item = plot_widget.getPlotItem()
-            item.getAxis('left').setPen(pg.mkPen(self.theme_colors['axis']))
-            item.getAxis('left').setTextPen(pg.mkPen(self.theme_colors['axis']))
-            item.getAxis('bottom').setPen(pg.mkPen(self.theme_colors['axis']))
-            item.getAxis('bottom').setTextPen(pg.mkPen(self.theme_colors['axis']))
+        self._set_merge_axis_unit_for_specs(self.merge_plot_specs)
+        self._set_merge_axis_unit_for_specs(self.bragg_merge_plot_specs)
 
-    def _set_merge_axis_unit(self):
-        """
-        Atualiza os eixos X da tab Merge conforme a unidade atual.
+        self._style_merge_plot_specs(self.merge_plot_specs)
+        self._style_merge_plot_specs(self.bragg_merge_plot_specs)
 
-        """
-        unit_label = {
-            'm': 'm',
-            'um': 'μm',
-            'nm': 'nm',
-            'pm': 'pm',
-        }.get(self.xUnit, 'nm')
+    def _refresh_bragg_merge_views(self):
+        """Redesenha a aba Merge do Bragg usando apenas os traces ativos do canal atual."""
+        if not hasattr(self, 'bragg_merge_plot_specs'):
+            return
 
-        for idx, (plot_widget, _) in enumerate(getattr(self, 'merge_plot_specs', [])):
+        for idx, (plot_widget, legend) in enumerate(self.bragg_merge_plot_specs):
+            if plot_widget is None:
+                continue
+            plot_widget.clear()
+            if legend is not None:
+                legend.clear()
             if idx == 0:
                 plot_widget.setLabel('left', 'Potência', units='dBm')
             else:
                 plot_widget.setLabel('left', '')
-            plot_widget.showGrid(x=(idx==0), y=(idx==0))
-            bottom_axis = pg.AxisItem(orientation='bottom')
-            if idx == 0:
-                bottom_axis.setLabel(text='Comprimento de Onda', units=unit_label)
-            else:
-                bottom_axis.setLabel(text='')
-            bottom_axis.enableAutoSIPrefix(False)
-            plot_widget.setAxisItems({'bottom': bottom_axis})
+            plot_widget.showGrid(x=(idx == 0), y=(idx == 0))
+
+        active_channel_state = self.channel_states.get(self.active_channel_idx, {})
+        trace_states = active_channel_state.get('trace_states', {}) or {}
+        active_traces = [trace_number for trace_number in self._active_bragg_traces() if trace_number in trace_states]
+        if not active_traces:
+            return
+
+        fix_button_colors = {
+            str(button): button.palette().color(QPalette.ColorRole.Button)
+            for button in self._list_fix_buttons()
+        }
+        trace_widgets = {
+            trace_idx: widget
+            for trace_idx, widget in enumerate(spec[0] for spec in self.bragg_merge_plot_specs[1:])
+            if widget is not None
+        }
+
+        for trace_number in active_traces:
+            trace_state = trace_states.get(trace_number, {})
+            fixed_traces = trace_state.get('fixed_traces', {}) or {}
+            if not fixed_traces:
+                continue
+
+            trace_widget = trace_widgets.get(trace_number)
+            trace_color = self.merge_channel_colors[trace_number % len(self.merge_channel_colors)]
+            trace_name = f'Trace {trace_number}'
+            first_curve = True
+
+            for trace_key, trace in fixed_traces.items():
+                if trace is None:
+                    continue
+
+                x_vals = np.asarray(trace[0], dtype=float)
+                y_vals = preprocess_plot_data(
+                    np.asarray(trace[1], dtype=float),
+                    self.window_methods,
+                    self.savgol_window_points,
+                    self.savgol_polyorder,
+                    self.window,
+                )
+
+                self.braggMergePlotWidget.plot(
+                    x_vals,
+                    y_vals,
+                    pen=pg.mkPen(trace_color, width=1),
+                    name=trace_name if first_curve else None,
+                )
+                if trace_widget is not None:
+                    trace_widget.plot(
+                        x_vals,
+                        y_vals,
+                        pen=pg.mkPen(fix_button_colors.get(trace_key, trace_color), width=1),
+                    )
+                first_curve = False
 
     def _refresh_merge_views(self):
         """
@@ -951,33 +1150,40 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         for channel_idx in range(len(self.channel_states)):
             state = self.channel_states.get(channel_idx, {})
-            fixed_traces = state.get('fixed_traces', {}) or {}
-            if not fixed_traces:
+            trace_states = state.get('trace_states', {}) or {}
+            if not trace_states:
                 continue
 
             color = self.merge_channel_colors[channel_idx % len(self.merge_channel_colors)]
             channel_plot = channel_widgets[channel_idx]
             channel_name = f'Canal {channel_idx + 1}'
-            first_trace = True
 
-            for trace_key, trace in fixed_traces.items():
-                if trace is None:
+            first_channel_curve = True
+            for trace_number, trace_state in sorted(trace_states.items()):
+                fixed_traces = trace_state.get('fixed_traces', {}) or {}
+                if not fixed_traces:
                     continue
 
-                x_vals = np.asarray(trace[0], dtype=float)
-                y_vals = preprocess_plot_data(
-                    np.asarray(trace[1], dtype=float),
-                    self.window_methods,
-                    self.savgol_window_points,
-                    self.savgol_polyorder,
-                    self.window,
-                )
+                for trace_key, trace in fixed_traces.items():
+                    if trace is None:
+                        continue
 
-                main_name = channel_name if first_trace else None
-                self.mergePlotWidget.plot(x_vals, y_vals, pen=pg.mkPen(color, width=1), name=main_name)
-                trace_color = fix_button_colors.get(trace_key, color)
-                channel_plot.plot(x_vals, y_vals, pen=pg.mkPen(trace_color, width=1))
-                first_trace = False
+                    x_vals = np.asarray(trace[0], dtype=float)
+                    y_vals = preprocess_plot_data(
+                        np.asarray(trace[1], dtype=float),
+                        self.window_methods,
+                        self.savgol_window_points,
+                        self.savgol_polyorder,
+                        self.window,
+                    )
+
+                    main_name = channel_name if first_channel_curve else None
+                    self.mergePlotWidget.plot(x_vals, y_vals, pen=pg.mkPen(color, width=1), name=main_name)
+                    trace_color = fix_button_colors.get(trace_key, color)
+                    channel_plot.plot(x_vals, y_vals, pen=pg.mkPen(trace_color, width=1))
+                    first_channel_curve = False
+
+                self._refresh_bragg_merge_views()
 
     def _default_channel_state(self) -> dict:
         """
@@ -997,8 +1203,45 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             'fixed_traces': {},
             'active_traces': [],
             'error_messages': [],
+            'warnings': [],
             'add_legend': True,
+            'in_view_trace': 0,
+            'trace_states': {
+                trace_number: self._default_trace_state(trace_number)
+                for trace_number in range(len(self.config_data.get('bragg_traces')))
+            },
         }
+
+    def _clone_state_snapshot(self, state: dict) -> dict:
+        """Create a shallow, container-safe copy of the current view state."""
+        return {
+            'spectra_data': list(state.get('spectra_data') or []),
+            'roi_range': list(state['roi_range']) if state.get('roi_range') is not None else None,
+            'temporal_roi_range': tuple(state['temporal_roi_range']) if state.get('temporal_roi_range') is not None else None,
+            'results_df': {key: list(value) for key, value in state.get('results_df', {}).items()},
+            'samples': dict(state.get('samples', {})),
+            'pending_hdf5': {key: list(value) for key, value in state.get('pending_hdf5', {}).items()},
+            'fixed_traces': dict(state.get('fixed_traces', {})),
+            'active_traces': list(state.get('active_traces', [])),
+            'error_messages': list(state.get('error_messages', [])),
+            'warnings': list(state.get('warnings', [])),
+            'in_view_trace': state.get('in_view_trace'),
+        }
+
+    def _capture_current_state(self, save_button_state: bool = True) -> dict:
+        """Capture the active channel state as an isolated snapshot."""
+        return self._clone_state_snapshot({
+            'spectra_data': self.spectra_data or [],
+            'roi_range': self.roi_range,
+            'temporal_roi_range': self.temporal_roi_region.getRegion(),
+            'results_df': self.results_df,
+            'samples': self.samples,
+            'pending_hdf5': self.pending_hdf5,
+            'fixed_traces': self.fixed_traces,
+            'active_traces': [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()] if save_button_state else self.active_traces,
+            'error_messages': self.error_messages,
+            'in_view_trace': self._active_trace_number(),
+        })
 
     def _enabled_tab_indices(self) -> list[int]:
         """
@@ -1028,28 +1271,66 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         channel_tabs = [i for i in range(self.tabWidget.count()) if i != merge_index]
         return channel_tabs[channel - 1]
 
-    def _save_active_channel_state(self, save_button_state: bool = True):
+    def _active_trace_number(self) -> int | None:
+        """Returns the currently visible Bragg trace number when applicable."""
+        if not self._is_braggmeter():
+            return None
+
+        current_index = self.tab_bragg.currentIndex()
+        if 0 <= current_index < self.tab_bragg.count():
+            return current_index
+        return None
+
+    def _on_bragg_trace_changed(self, index: int):
+        """Persist the previous trace and restore the newly selected one."""
+        if not self._is_braggmeter():
+            return
+
+        previous_trace = self.in_view_trace
+        if previous_trace is None:
+            previous_trace = self._active_trace_number()
+        if previous_trace is not None:
+            self._save_active_channel_state(save_button_state=True, trace_number=previous_trace)
+
+        if 0 <= index < self.tab_bragg.count():
+            self._restore_channel_state(self.active_channel_idx, trace=index)
+            # Ensure UI updates immediately when user switches trace tabs,
+            # even if acquisition is paused.
+            self._refresh_active_channel_view(sync_buttons=True)
+
+    def _save_active_channel_state(self, save_button_state: bool = True, trace_number: int | None = None):
         """
         Salva o estado do canal ativo.
         Args:
             save_button_state (bool): Se True, salva o estado dos botões de fixação. Caso contrário, mantém o estado atual dos botões.
         
         """
-        state = self.channel_states.get(self.active_channel_idx, self._default_channel_state())
-        active_traces = [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()] if save_button_state else state.get('active_traces', [])
-        self.channel_states[self.active_channel_idx] = {
-            'spectra_data': self.spectra_data or [],
-            'roi_range': self.roi_range,
-            'temporal_roi_range': self.temporal_roi_region.getRegion(),
-            'results_df': self.results_df,
-            'samples': self.samples,
-            'pending_hdf5': self.pending_hdf5,
-            'fixed_traces': self.fixed_traces,
-            'active_traces': active_traces,
-            'error_messages': self.error_messages,
-        }
+        state = self._capture_current_state(save_button_state=save_button_state)
+        channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
+        visible_trace = self._active_trace_number() if self._is_braggmeter() else None
+        if trace_number is None:
+            trace_number = self.in_view_trace
+        if trace_number is None and self._is_braggmeter():
+            trace_number = self._active_trace_number()
+        if trace_number is None:
+            trace_number = 0
 
-    def _restore_channel_state(self, index: int):
+        if self._is_braggmeter() and isinstance(channel_state.get('trace_states'), dict):
+            trace_state = channel_state['trace_states'].get(trace_number, {})
+            state['warnings'] = list(trace_state.get('warnings', []))
+            state['in_view_trace'] = trace_number
+        else:
+            state['warnings'] = list(channel_state.get('warnings', []))
+
+        channel_state['in_view_trace'] = visible_trace if visible_trace is not None else trace_number
+        channel_state['error_messages'] = state['error_messages']
+        channel_state['trace_states'][trace_number] = self._clone_state_snapshot(state)
+
+        if self._is_braggmeter() and isinstance(channel_state.get('trace_states'), dict):
+            channel_state['trace_states'][trace_number] = self._clone_state_snapshot(state)
+            channel_state['in_view_trace'] = visible_trace if visible_trace is not None else trace_number
+
+    def _restore_channel_state(self, index: int, trace: int | None = None):
         """
         Restaura o estado de um canal específico.
         Args:
@@ -1058,6 +1339,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         state = self.channel_states.setdefault(index, self._default_channel_state())
         self.active_channel_idx = index
+
+        trace_number = trace if trace is not None else state.get('in_view_trace', 0)
+        if self._is_braggmeter() and isinstance(state.get('trace_states'), dict):
+            trace_state = state['trace_states'].get(trace_number, state)
+            state = trace_state
+        else:
+            trace_number = None
+
         self.spectra_data = state['spectra_data']
         self.roi_range = state['roi_range']
         temporal_roi_range = state.get('temporal_roi_range')
@@ -1071,9 +1360,28 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.fixed_traces = state['fixed_traces']
         self.active_traces = state['active_traces']
         self.error_messages = state['error_messages']
+        self.in_view_trace = trace_number if trace_number is not None else state.get('in_view_trace')
 
         if temporal_roi_range is not None:
             self.temporal_roi_region.setRegion(temporal_roi_range)
+
+        if self._is_braggmeter() and hasattr(self, 'tab_bragg'):
+            trace_index = trace_number if trace is None else trace
+            if 0 <= trace_index < self.tab_bragg.count():
+                target_widget = self.tab_bragg.widget(trace_index)
+                if target_widget is not None:
+                    current_widget = self.tab_bragg.currentWidget()
+                    if current_widget is not target_widget:
+                        self.tab_bragg.blockSignals(True)
+                        self.tab_bragg.setCurrentIndex(trace_index)
+                        self.tab_bragg.blockSignals(False)
+                    layout = target_widget.layout()
+                    if layout is None:
+                        layout = QVBoxLayout(target_widget)
+                    is_bragg_merge_tab = target_widget is getattr(self, 'bragg_merge', None)
+                    if (not is_bragg_merge_tab) and self.main_qwt.parent() is not target_widget:
+                        self.main_qwt.setParent(None)
+                        layout.addWidget(self.main_qwt)
 
         self._sync_fix_buttons_ui()
 
@@ -1105,6 +1413,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         self.spectraPlotWidget.clear()
         self.spectraPlotWidget.addItem(self.roi_region)
+        # spectraPlotWidget.clear() removeu as InfiniteLines; descarta as referências.
+        self._peak_marker_lines.clear()
         self.temporalPlotWidget.clear()
         self.temporalPlotWidget.addItem(self.temporal_roi_region)
         self.boxPlot.clear()
@@ -1136,39 +1446,41 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
     def _request_cycle_data(self):
         """
-        Solicita dados cíclicos da thread de aquisição para os canais habilitados. 
+        Solicita dados cíclicos da thread de aquisição para os canais habilitados.
         
         """
         if (not self._running) or self._is_stopping or self.worker is None or self.thread is None:
             return
 
-        bragg_mode = self.config_data.get('inter') in ('BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM')
-        bragg_channel = int(self.cfg_spin.value()) if bragg_mode else 0
         has_switch = bool(self.config_data.get('switch_ports'))
 
-        if not has_switch:
-            self._cycle_started_at = time.monotonic()
-            self._cycle_pending_responses = 1
-            switch_channel = self._active_channel_number()
-            self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
-            return
+        channels = self.enabled_channels if has_switch else [self.active_channel_idx]
+        if not channels:
+            channels = [self.active_channel_idx]
 
-        if len(self.enabled_channels) > 1:
-            self._cycle_started_at = time.monotonic()
-            self._cycle_pending_responses = len(self.enabled_channels)
-            for tab_idx in self.enabled_channels:
-                switch_channel = tab_idx + 1
-                self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
-            return
-
+        self._cycle_channels = list(channels)
+        self._cycle_channel_index = 0
         self._cycle_started_at = time.monotonic()
-        self._cycle_pending_responses = 1
-        if self.enabled_channels:
-            switch_channel = self.enabled_channels[0] + 1
-        else:
-            switch_channel = self._active_channel_number()
+        self._cycle_pending_responses = len(channels)
+        self._request_next_cycle_channel()
 
-        self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_channel)
+    def _request_next_cycle_channel(self):
+        """
+        Dispara a próxima aquisição do ciclo de multiplexação.
+
+        """
+        if (not self._running) or self._is_stopping or self.worker is None or self.thread is None:
+            return
+
+        if self._cycle_channel_index >= len(self._cycle_channels):
+            return
+
+        ch_idx = self._cycle_channels[self._cycle_channel_index]
+        self._cycle_channel_index += 1
+
+        switch_channel = ch_idx + 1
+        bragg_traces = self.config_data.get('bragg_traces')
+        self.request_data_signal.emit(self.mean_samples, switch_channel, bragg_traces)
 
     def _arm_request_timer(self, delay_ms: int | None = None):
         """
@@ -1212,15 +1524,22 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._cycle_started_at = None
         self._arm_request_timer(next_delay_ms)
 
-    def _handle_data_acquired(self, data, warning, channel: int, *a):
+    def _handle_data_acquired(self, spec, warning, channel: int, *a):
         """
         Encaminha os dados recebidos e atualiza o agendamento do próximo ciclo.
 
         """
         try:
-            self.update_plot(data, warning, channel)
+            self.update_plot(spec, warning, channel)
         finally:
             self._on_cycle_response_received()
+            if (
+                self._running
+                and not self._is_stopping
+                and self._cycle_pending_responses > 0
+                and self._cycle_channel_index < len(self._cycle_channels)
+            ):
+                self._request_next_cycle_channel()
 
     def _on_tab_changed(self, index: int):
         """
@@ -1231,13 +1550,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         self._save_active_channel_state()
         self.main_qwt.setParent(None) # Remove o gráfico da hierarquia atual
+        if self._is_braggmeter():
+            self.tab_bragg.setParent(None)
 
         if index == self.tabWidget.indexOf(getattr(self, 'tab_merge')):
             self._refresh_merge_views()
             return
 
         self._restore_channel_state(index)
-        self.tabWidget.widget(index).layout().addWidget(self.main_qwt) # Adiciona o container principal à aba selecionada
+        self._refresh_merge_views()
+        if self._is_braggmeter():
+            self.tabWidget.widget(index).layout().addWidget(self.tab_bragg) # Adiciona as subabas do BraggMeter à aba selecionada
+        else:
+            self.tabWidget.widget(index).layout().addWidget(self.main_qwt) # Adiciona o container principal à aba selecionada
         self._refresh_active_channel_view(sync_buttons=False)
 
     def _unit_to_meter_factor(self, unit: str) -> float:
@@ -1514,7 +1839,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             plot_kwargs['fillLevel'] = float(np.min(y_values))
             plot_kwargs['brush'] = brush
 
-        self.spectraPlotWidget.plot(x_values, y_values, **plot_kwargs)
+        try:
+            self.spectraPlotWidget.plot(x_values, y_values, **plot_kwargs)
+        except Exception as e:
+            self._show_error(f"Erro ao plotar espectro: {str(e)}")
 
         for button in self._list_fix_buttons():
             if button.isChecked():
@@ -1604,10 +1932,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         for widget in (self.spectraPlotWidget, self.temporalPlotWidget, self.boxPlotWidget):
             widget.setBackground(self.theme_colors['plot_bg'])
         
-        for plot_widget, _ in getattr(self, 'merge_plot_specs', []):
-            plot_widget.setBackground(self.theme_colors['plot_bg'])
+        for plot_widget, _ in [*getattr(self, 'merge_plot_specs', []), *getattr(self, 'bragg_merge_plot_specs', [])]:
+            if plot_widget is not None:
+                plot_widget.setBackground(self.theme_colors['plot_bg'])
 
-        for plot_widget in (self.spectraPlotWidget, self.temporalPlotWidget, *[spec[0] for spec in getattr(self, 'merge_plot_specs', [])]):
+        for plot_widget in (
+            self.spectraPlotWidget,
+            self.temporalPlotWidget,
+            *[spec[0] for spec in getattr(self, 'merge_plot_specs', [])],
+            *[spec[0] for spec in getattr(self, 'bragg_merge_plot_specs', [])],
+        ):
+            if plot_widget is None:
+                continue
             item = plot_widget.getPlotItem()
             item.getAxis('left').setPen(pg.mkPen(self.theme_colors['axis']))
             item.getAxis('left').setTextPen(pg.mkPen(self.theme_colors['axis']))
@@ -1670,6 +2006,26 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         self.config_data = config
         self.config_data['theme'] = self.theme
+
+        if self._is_braggmeter():
+            # Conecta a mudança de subaba de trace ao handler
+            self.tab_bragg.currentChanged.connect(self._on_bragg_trace_changed)
+            selected_traces = self._active_bragg_traces()
+            for trace_idx in range(self.tab_bragg.count()):
+                is_merge_tab = trace_idx == self.tab_bragg.indexOf(getattr(self, 'bragg_merge', None))
+                self.tab_bragg.setTabEnabled(trace_idx, is_merge_tab or trace_idx in selected_traces)
+        else:
+             # Remove da tab interna
+            idx = self.tab_bragg.indexOf(self.main_qwt)
+            if idx != -1:
+                self.tab_bragg.removeTab(idx)
+
+            # Move para a tab externa
+            self.main_qwt.setParent(None)
+            self.tab_ch1.layout().addWidget(self.main_qwt)
+            
+            # Remove o tab widget interno
+            self.tab_bragg.hide()
  
         # Aplica o tema
         self.set_theme(self.theme, persist=False)
@@ -1703,7 +2059,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         first_enabled = self.enabled_channels[0] if self.enabled_channels else 0
         self.tabWidget.setCurrentIndex(first_enabled)
-        self._restore_channel_state(first_enabled)
+        if self._is_braggmeter():
+            trace_numbers = self._active_bragg_traces()
+            initial_trace = trace_numbers[0] if trace_numbers else 0
+            self._restore_channel_state(first_enabled, trace=initial_trace)
+        else:
+            self._restore_channel_state(first_enabled)
         self._apply_fiber_mode()
         self._load_fiber_specific_settings()
         if self._fiber_mode() != 'FBG':
@@ -1713,7 +2074,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._save_persistent_settings()
 
         self._run()
-        QApplication.instance().restoreOverrideCursor()
 
     def unit_changed(self, unit: str):
         """
@@ -1755,8 +2115,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 state['spectra_data'] = list(zip(x_new, y_new))
 
             fixed_traces = state.get('fixed_traces', {})
-            for btn, trace in list(fixed_traces.items()):
-                x_old, y_vals = trace
+            for btn, trace_item in list(fixed_traces.items()):
+                x_old, y_vals = trace_item
                 x_new = np.asarray(x_old, dtype=float) * scale_old_to_new
                 fixed_traces[btn] = (x_new, np.asarray(y_vals, dtype=float))
 
@@ -1784,6 +2144,29 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self._refresh_active_channel_view()
         self._refresh_merge_views()
         self._save_persistent_settings()
+
+    def _clear_layout(self, layout):
+        """
+        Remove recursivamente todos os widgets e sublayouts de um layout, e depois o próprio layout.
+        Args:
+            layout (QLayout): O layout a ser limpo.
+        
+        """
+        if not hasattr(self, layout.__class__.__name__):
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+
+            widget = item.widget()
+            child_layout = item.layout()
+
+            if widget is not None:
+                widget.deleteLater()
+
+            elif child_layout is not None:
+                self._clear_layout(child_layout)
+
+        layout.deleteLater()
 
     def _run(self):
         """
@@ -1819,12 +2202,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # Conecta os sinais e slots da thread e do worker
         self.thread.started.connect(self.worker.run)
-        self.thread.started.connect(self._thread_started)
         self.request_data_signal.connect(self.worker.request_data, Qt.QueuedConnection)
         self.stop_worker_signal.connect(self.worker.stop, Qt.QueuedConnection)
         self.worker.data_acquired.connect(self._handle_data_acquired)
         self.worker.finished.connect(self._cleanup_thread)
         self.worker.error_occurred.connect(self._show_error)
+        self.worker.start_thread.connect(self._thread_started)
         time.sleep(.1)
         
         self.thread.start()
@@ -1860,13 +2243,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.cfg_lbl.setText("Tempo de Exposição (µs)")
                 self.cfg_spin.setRange(3, 65535) # Limita o tempo de exposição
                 self.cfg_spin.setSingleStep(100)
-            case 'BRAGGMETER FS22DI':
-                self.cfg_lbl.setText("Canal (0-3)")
-                self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter
+            case 'BRAGGMETER FS22DI': # Remove o controle de tempo de exposição
+                self._clear_layout(self.et_vlay)
                 self.exposure_time = -1
-            case 'BRAGGMETER FS22DI HBM':
-                self.cfg_lbl.setText("Canal (0-3)")
-                self.cfg_spin.setRange(2, 3) # Canais de transmissão do BraggMeter HBM
+            case 'BRAGGMETER FS22DI HBM': # Remove o controle de tempo de exposição
+                self._clear_layout(self.et_vlay)
                 self.exposure_time = -1
             case 'THORLABS CCT11':
                 self.cfg_lbl.setText("Tempo de Exposição (µs)")
@@ -1903,7 +2284,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True)
         self.sr_lbl.setEnabled(True)
-        if self.config_data.get('inter') != 'THORLABS OSA203':
+        if self.config_data.get('inter') != 'THORLABS OSA203' and self.exposure_time >= 0:
             self.cfg_spin.setEnabled(True)
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
@@ -1916,6 +2297,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Retoma a aquisição usando a mesma thread/worker já inicializados.
 
         """
+        if self._connection_lost:
+            if self.thread is not None or self.worker is not None:
+                self._cleanup_thread()
+            self._run()
+            return
+
         if self.thread is None or self.worker is None:
             self._run()
             return
@@ -1955,6 +2342,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             message (str): Mensagem de erro a ser exibida.
         
         """
+        QApplication.instance().restoreOverrideCursor()
+        if 'max retries' in message.lower() or 'timeout' in message.lower():
+            self._connection_lost = True
+
         QMessageBox.warning(self, title, message)
         # Em caso de erro de comunicação, apenas interrompe a aquisição
         # mantendo a janela aberta para análise offline.
@@ -1963,15 +2354,18 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         except Exception:
             pass
 
-    def _show_warning(self, message: str, channel: int | None = None):
+    def _show_warning(self, message, channel: int | None = None, trace_number: int | None = None):
         """
         Mostra uma caixa de diálogo de aviso de forma não-bloqueante.
         Args:
             message (str): Mensagem de aviso a ser exibida.
+            channel (int | None): Número do canal (1-4).
         
         """
         # Determina o índice do canal para este aviso (usa o canal ativo se não fornecido)
         target_idx = self.active_channel_idx if channel is None else self._channel_index_from_number(channel)
+        if trace_number is None:
+            trace_number = self._active_trace_number()
 
         if message:
             # Garante que o botão/ícone exista (indicador minimizado visível para todos os canais)
@@ -1984,11 +2378,28 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 # Ao clicar, mostra os avisos agregados do canal ativo
                 self.warning_btn.clicked.connect(lambda: QMessageBox.warning(self, "Aviso", '\n'.join(self._gather_active_warnings())))
 
-            messages = [m.strip() for m in message.split(',') if m.strip()]
+            if isinstance(message, (list, tuple, set)):
+                raw_messages = message
+            else:
+                raw_messages = str(message).split(',')
+
+            messages = [str(m).strip() for m in raw_messages if str(m).strip()]
+
+            # Adiciona sufixo do trace se for BraggMeter
+            if self._is_braggmeter():
+                if trace_number is not None:
+                    messages = [f"{msg} (Trace {trace_number})" for msg in messages]
+                else:
+                    traces = self._active_bragg_traces()
+                    messages = [f"{msg} (Trace {traces[i]})" for i, msg in enumerate(messages)]
 
             # Garante que o estado do canal tenha a lista de avisos
             state = self.channel_states.setdefault(target_idx, self._default_channel_state())
-            channel_warnings = state.setdefault('warnings', [])
+            if self._is_braggmeter() and trace_number is not None and isinstance(state.get('trace_states'), dict):
+                trace_state = state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+                channel_warnings = trace_state.setdefault('warnings', [])
+            else:
+                channel_warnings = state.setdefault('warnings', [])
 
             for msg in messages:
                 # Adiciona à lista minimizada deste canal para que o ícone indique
@@ -2015,11 +2426,21 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             for st in self.channel_states.values():
                 if 'warnings' in st:
                     st['warnings'].clear()
+                if isinstance(st.get('trace_states'), dict):
+                    for trace_state in st['trace_states'].values():
+                        if isinstance(trace_state, dict) and 'warnings' in trace_state:
+                            trace_state['warnings'].clear()
             self._warning_popup_shown.clear()
 
     def _gather_active_warnings(self) -> list[str]:
         """Retorna os avisos agregados para o canal atualmente ativo."""
         state = self.channel_states.get(self.active_channel_idx, {})
+        if self._is_braggmeter() and isinstance(state.get('trace_states'), dict):
+            trace_number = self._active_trace_number()
+            if trace_number is not None:
+                trace_state = state['trace_states'].get(trace_number)
+                if trace_state is not None:
+                    return trace_state.get('warnings', [])
         return state.get('warnings', [])
 
     def _update_fixed_list(self, button: QPushButton):
@@ -2029,7 +2450,17 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             button (QPushButton): Botão de fixação cujo espectro deve ser removido.
 
         """
-        self.fixed_traces.pop(str(button), None)
+        trace_number = self._active_trace_number() if self._is_braggmeter() else None
+        if self._is_braggmeter() and trace_number is not None:
+            channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
+            trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+            trace_state.get('fixed_traces', {}).pop(str(button), None)
+            if str(button) in trace_state.get('active_traces', []):
+                trace_state['active_traces'] = [name for name in trace_state['active_traces'] if name != str(button)]
+            self.fixed_traces = trace_state['fixed_traces']
+            self.active_traces = trace_state['active_traces']
+        else:
+            self.fixed_traces.pop(str(button), None)
 
         idx = self._list_fix_buttons().index(button)
         item = self.fixedLines_vlay.itemAt(idx)
@@ -2041,7 +2472,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 x_vals, y_vals = zip(*self.spectra_data)
                 # Redesenha o espectro atual para limpar as curvas fixadas
                 self._plot_spectrum_curve(np.asarray(x_vals, dtype=float), np.asarray(y_vals, dtype=float))
-            self._save_active_channel_state()
+            self._save_active_channel_state(trace_number=trace_number)
         self._refresh_merge_views()
 
     def toggle_fix(self, button: QPushButton, pos):
@@ -2065,6 +2496,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             checked (bool): Estado do botão após o clique (True se marcado, False se desmarcado).
 
         """
+        trace_number = self._active_trace_number() if self._is_braggmeter() else None
+        channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
+        trace_state = None
+        if self._is_braggmeter() and trace_number is not None:
+            trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+
         if str(button) in self.fixed_traces:
             if not self._running:
                 if checked:
@@ -2083,7 +2520,16 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 button.setChecked(False) # Impede de marcar se não houver espectro para fixar
                 return
             x, y = zip(*self.spectra_data)
-            self.fixed_traces[str(button)] = (np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+            trace_payload = (np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+            if trace_state is not None:
+                trace_state.setdefault('fixed_traces', {})[str(button)] = trace_payload
+                trace_state.setdefault('active_traces', [])
+                if str(button) not in trace_state['active_traces']:
+                    trace_state['active_traces'].append(str(button))
+                self.fixed_traces = trace_state['fixed_traces']
+                self.active_traces = trace_state['active_traces']
+            else:
+                self.fixed_traces[str(button)] = trace_payload
 
             idx = self._list_fix_buttons().index(button)
             item = self.fixedLines_vlay.itemAt(idx)
@@ -2107,8 +2553,13 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 line.setStyleSheet(
                     f"background-color: rgba({color.red()}, {color.green()}, {color.blue()}, 90)"
                 )
-        self._save_active_channel_state()
-        self.active_traces = [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()]
+        if trace_state is not None:
+            trace_state['fixed_traces'] = self.fixed_traces
+            trace_state['active_traces'] = [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()]
+            self.active_traces = trace_state['active_traces']
+        else:
+            self.active_traces = [str(btn) for btn in self._list_fix_buttons() if btn.isChecked()]
+        self._save_active_channel_state(trace_number=trace_number)
         self._refresh_merge_views()
             
     def _cleanup_thread(self):
@@ -2198,7 +2649,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.stop_btn.setStyleSheet("QPushButton { background-color: #60fa93; color: #0f172a; }")
         self.sr_spin.setEnabled(True) # Habilita o controle de intervalo entre amostras
         self.sr_lbl.setEnabled(True)
-        if self.config_data.get('inter') != 'THORLABS OSA203':
+        if self.config_data.get('inter') != 'THORLABS OSA203' and self.exposure_time >= 0:
             self.cfg_spin.setEnabled(True) # Habilita o controle de tempo de exposição
             self.cfg_lbl.setEnabled(True)
         self.continuous_chk.setEnabled(True)
@@ -2273,50 +2724,65 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             if state is None:
                 continue
 
-            pending = state['pending_hdf5']
-            pending_count = len(pending['Timestamp'])
-            if pending_count == 0:
-                continue
-            if not force and pending_count < self.flush_batch_size:
-                continue
+            trace_entries = []
+            if self._is_braggmeter() and isinstance(state.get('trace_states'), dict):
+                trace_entries = [
+                    (trace_number, trace_state)
+                    for trace_number, trace_state in sorted(state['trace_states'].items())
+                    if trace_state is not None
+                ]
+            else:
+                trace_entries = [(None, state)]
 
-            try:
-                inter = self.config_data.get('inter') if self.config_data else None
-                file_path = self.file_path or (self.config_data.get('path') if self.config_data else None)
-                if not inter or not file_path:
+            for trace_number, trace_state in trace_entries:
+                pending = trace_state['pending_hdf5']
+                pending_count = len(pending['Timestamp'])
+                if pending_count == 0:
+                    continue
+                if not force and pending_count < self.flush_batch_size:
                     continue
 
-                intensities = np.asarray(pending['Intensidade'], dtype=np.float32)
-                timestamps = np.asarray(pending['Timestamp'], dtype=np.float64)
-                result_key = self._result_key()
-                values = pending[result_key]
+                try:
+                    inter = self.config_data.get('inter') if self.config_data else None
+                    file_path = self.file_path or (self.config_data.get('path') if self.config_data else None)
+                    if not inter or not file_path:
+                        continue
 
-                append_samples(
-                    range_cfg=self.config_data.get('range'),
-                    res=self.config_data.get('res'),
-                    file_path=file_path,
-                    inter=inter,
-                    intensities=intensities,
-                    timestamps=timestamps,
-                    values=values,
-                    sample_name=self.sample_name or "Atual",
-                    dataset_name=result_key,
-                )
+                    intensities = np.asarray(pending['Intensidade'], dtype=np.float32)
+                    timestamps = np.asarray(pending['Timestamp'], dtype=np.float64)
+                    result_key = self._result_key()
+                    values = pending[result_key]
+                    sample_name = self.sample_name or "Atual"
+                    if trace_number is not None:
+                        sample_name = f"{sample_name} - Trace {trace_number}"
+                    trace_suffix = f" trace {trace_number}" if trace_number is not None else ""
 
-                state['pending_hdf5'] = self._empty_result_store()
-                if idx == self.active_channel_idx:
-                    self.pending_hdf5 = state['pending_hdf5']
-                logger.debug(f"Flush contínuo realizado no canal {idx + 1} com {pending_count} registro(s).")
-            except Exception as e:
-                logger.error(f"Erro ao salvar buffer contínuo (canal {idx + 1}): {e}")
+                    append_samples(
+                        range_cfg=self.config_data.get('range'),
+                        res=self.config_data.get('res'),
+                        file_path=file_path,
+                        inter=inter,
+                        intensities=intensities,
+                        timestamps=timestamps,
+                        values=values,
+                        sample_name=sample_name,
+                        dataset_name=result_key,
+                    )
+
+                    trace_state['pending_hdf5'] = self._empty_result_store()
+                    if idx == self.active_channel_idx and trace_number == self._active_trace_number():
+                        self.pending_hdf5 = trace_state['pending_hdf5']
+                    logger.debug(f"Flush contínuo realizado no canal {idx + 1}{trace_suffix} com {pending_count} registro(s).")
+                except Exception as e:
+                    logger.error(f"Erro ao salvar buffer contínuo (canal {idx + 1}{trace_suffix}): {e}")
 
     def update_plot(self, data, warning, channel: int):
         """
-        Atualiza o gráfico com os dados adquiridos.
+        Atualiza o gráfico com os dados adquiridos.        
         Args:
-            data (list of tuples): Lista de tuplas contendo os dados do espectro (x, y).
-            warning (str): Mensagem de aviso a ser exibida, se houver.
-            channel (int): Número do canal de onde os dados foram adquiridos.
+            data: Lista de tuplas (para BraggMeter) ou espectro único
+            warning: Lista de mensagens de aviso (para BraggMeter) ou string única
+            channel (int): Número do canal de onde os dados foram adquiridos
         
         """
         if not self._running:
@@ -2324,16 +2790,85 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         QApplication.instance().restoreOverrideCursor()
         self.stop_btn.setEnabled(True)
-        self._show_warning(warning, channel)
+        if not (self._is_braggmeter() and isinstance(warning, list)):
+            self._show_warning(warning, channel)
 
         target_idx = self._channel_index_from_number(channel)
         if target_idx not in self.channel_states:
             self.channel_states[target_idx] = self._default_channel_state()
 
         current_visible_idx = self.active_channel_idx
-        self._save_active_channel_state()
-        self._restore_channel_state(target_idx)
-        
+        visible_trace = self._active_trace_number() if self._is_braggmeter() else None
+        # Só salva e restaura quando o canal alvo é diferente do visível; caso contrário
+        # os atributos de instância já contêm o estado correto e o clone desnecessário
+        # de results_df (que cresce com o tempo) bloqueia o event loop sem necessidade.
+        if target_idx != current_visible_idx:
+            self._save_active_channel_state()
+            self._restore_channel_state(target_idx, trace=visible_trace)
+
+        if self._is_braggmeter() and isinstance(data, list):
+            active_traces = self._active_bragg_traces()
+            warning_items = warning if isinstance(warning, list) else [warning] * len(data)
+            trace_payloads = []
+
+            for trace_pos, trace_number in enumerate(active_traces):
+                if trace_pos >= len(data):
+                    break
+                trace_warning = warning_items[trace_pos] if trace_pos < len(warning_items) else warning_items[-1]
+                trace_payloads.append((trace_number, data[trace_pos], trace_warning))
+
+            if visible_trace is not None:
+                trace_payloads.sort(key=lambda item: item[0] == visible_trace)
+
+            channel_state = self.channel_states[target_idx]
+
+            for trace_number, trace_data, trace_warning in trace_payloads:
+                trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+                self._apply_state_snapshot(trace_state, sync_regions=False)
+                self._show_warning(trace_warning, channel, trace_number=trace_number)
+
+                x, y = zip(*trace_data)
+                x = np.asarray(x, dtype=float)
+                y = np.asarray(y, dtype=float)
+                x *= self._unit_to_meter_factor('nm') / self._unit_to_meter_factor(self.xUnit)
+                self._set_spectrum_axis_unit()
+
+                self.spectra_data = list(zip(x, y))
+                if trace_number == visible_trace:
+                    self._plot_spectrum_curve(x, y)
+
+                if self.config_data.get('fiber') != 'FBG' and self.roi_range is None:
+                    x_min = min(x)
+                    x_max = max(x)
+                    x_range = x_max - x_min
+                    self.roi_range = [(x_min + 0.25 * x_range), (x_max - 0.25 * x_range)]
+                    if trace_number == visible_trace:
+                        self.roi_region.setRegion(self.roi_range)
+                    else:
+                        self.roi_region.blockSignals(True)
+                        try:
+                            self.roi_region.setRegion(self.roi_range)
+                        finally:
+                            self.roi_region.blockSignals(False)
+                    logger.debug(f"ROI inicial definida para: {self.roi_range}")
+                elif self.config_data.get('fiber') == 'FBG':
+                    self.roi_range = None
+
+                self.process_spectra(update_views=(trace_number == visible_trace))
+                self._save_active_channel_state(save_button_state=False, trace_number=trace_number)
+
+            no_switch_bragg = (
+                self.config_data.get('inter') in ('BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM')
+                and not self.config_data.get('switch_ports')
+            )
+            if target_idx == current_visible_idx and visible_trace is not None:
+                self._restore_channel_state(target_idx, trace=visible_trace)
+                self._refresh_active_channel_view(sync_buttons=False)
+            if target_idx != current_visible_idx and not no_switch_bragg:
+                self._restore_channel_state(current_visible_idx)
+                self._refresh_active_channel_view(sync_buttons=False)
+            return
+
         x, y = zip(*data)
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
@@ -2365,7 +2900,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self._restore_channel_state(current_visible_idx)
             self._refresh_active_channel_view(sync_buttons=False)
 
-    def process_spectra(self):
+    def process_spectra(self, update_views: bool = True):
         """
         Executa o algoritmo de detecção de picos para o espectro na ROI.
         
@@ -2438,7 +2973,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.results_df['Intensidade'].append(intensities)
             self.results_df['Picos'].append(peak_values)
 
-            if self.continuous_chk.isChecked() and len(self.results_df['Timestamp']) > self.max_live_points:
+            # Trimming aplicado sempre (não apenas no modo contínuo) para impedir crescimento
+            # ilimitado de results_df em sessões longas, independentemente do modo de operação.
+            if len(self.results_df['Timestamp']) > self.max_live_points:
                 excess = len(self.results_df['Timestamp']) - self.max_live_points
                 self.results_df['Timestamp'] = self.results_df['Timestamp'][excess:]
                 self.results_df['Intensidade'] = self.results_df['Intensidade'][excess:]
@@ -2450,7 +2987,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.pending_hdf5['Picos'].append(peak_values)
                 self._flush_continuous_buffer()
 
-            if len(self.results_df['Timestamp']) < 3:
+            if update_views and len(self.results_df['Timestamp']) < 3:
                 self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
             logger.debug(f"Processamento {fiber_type} concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
             logger.debug(f"Último conjunto detectado ({'vales' if fiber_type == 'INT' else 'picos'}): {peak_values}")
@@ -2475,8 +3012,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.results_df['Intensidade'].append(intensities)
                 self.results_df['Vale'].append(res_wl)
 
-                # Mantém apenas parte do histórico em memória para evitar degradação da UI.
-                if self.continuous_chk.isChecked() and len(self.results_df['Timestamp']) > self.max_live_points:
+                # Trimming aplicado sempre (não apenas no modo contínuo) para impedir crescimento
+                # ilimitado de results_df em sessões longas, independentemente do modo de operação.
+                if len(self.results_df['Timestamp']) > self.max_live_points:
                     excess = len(self.results_df['Timestamp']) - self.max_live_points
                     self.results_df['Timestamp'] = self.results_df['Timestamp'][excess:]
                     self.results_df['Intensidade'] = self.results_df['Intensidade'][excess:]
@@ -2494,7 +3032,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             logger.debug(f"Último pico detectado: {locals().get('res_wl')} m, Total de medições: {len(self.results_df['Timestamp'])}")
 
         # 5. Chama a função para atualizar os gráficos com os resultados
-        self._update_plots_with_results()
+        if update_views:
+            self._update_plots_with_results()
     
     def _update_plots_with_results(self):
         """
@@ -2548,10 +3087,12 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
             logger.debug("Gráfico FBG de evolução temporal atualizado.")
 
-            # Atualiza linhas verticais no gráfico de espectros para os últimos picos
-            for item in list(self.spectraPlotWidget.items()):
-                if isinstance(item, pg.InfiniteLine):
-                    self.spectraPlotWidget.removeItem(item)
+            # Atualiza linhas verticais no gráfico de espectros para os últimos picos.
+            # Remove apenas as linhas rastreadas em _peak_marker_lines, sem precisar
+            # iterar sobre todos os items do plot para encontrá-las por tipo.
+            for line in self._peak_marker_lines:
+                self.spectraPlotWidget.removeItem(line)
+            self._peak_marker_lines.clear()
 
             if self.results_df['Picos']:
                 last_peaks = self.results_df['Picos'][-1]
@@ -2575,6 +3116,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                             pen={'color': color, 'style': pg.QtCore.Qt.DashLine}
                         )
                         self.spectraPlotWidget.addItem(line)
+                        self._peak_marker_lines.append(line)
             logger.debug("Marcadores de %s adicionados ao gráfico de espectros.", 'vale' if is_int else 'pico')
 
             current_peak_samples = self._fbg_current_peak_samples(
@@ -2613,10 +3155,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         logger.debug("Gráfico de evolução temporal atualizado.")
 
         # --- Atualiza Gráfico 1: Adiciona Marcadores de Pico ---
-        # Primeiro, remove marcadores antigos (se existirem)
-        for item in self.spectraPlotWidget.items():
-            if isinstance(item, pg.InfiniteLine):
-                self.spectraPlotWidget.removeItem(item)
+        # Remove apenas as linhas rastreadas, sem varrer todos os items do plot.
+        for line in self._peak_marker_lines:
+            self.spectraPlotWidget.removeItem(line)
+        self._peak_marker_lines.clear()
 
         # Adiciona uma linha vertical para o último pico encontrado
         line = pg.InfiniteLine(
@@ -2626,6 +3168,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             pen={'color': self.theme_colors['accent'], 'style': pg.QtCore.Qt.DashLine}
         )
         self.spectraPlotWidget.addItem(line)
+        self._peak_marker_lines.append(line)
         logger.debug(f"Marcador de pico adicionado ao gráfico de espectros.")
 
         # Seleciona a ROI temporal atual para filtrar os dados computados pelo box plot
@@ -2761,6 +3304,8 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.results_df = self._empty_result_store()
         self.pending_hdf5 = self._empty_result_store()
         self._clear_fbg_peak_colors()
+        # spectraPlotWidget.clear() já removeu os itens; apenas descarta as referências.
+        self._peak_marker_lines.clear()
         self.spectra_data = []
         self.roi_range = None
         self.fixed_traces = {}
@@ -2830,77 +3375,96 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         # --- Passo 4: Processa e filtra os dados da ROI ---
         try:
-            timestamps = np.asarray(self.results_df['Timestamp'], dtype=np.float64)
-            intensities = self.results_df['Intensidade']
-
-            if self._fiber_mode() in ('FBG', 'INT'):
-                peak_values = self.results_df['Picos']
-                timestamps_filtered = timestamps
-                intensities_filtered = np.asarray(intensities, dtype=np.float32)
-                resonant_filtered = peak_values
-
-                if not self._flatten_peak_values(peak_values):
-                    feature_plural = 'vales' if self._fiber_mode() == 'INT' else 'picos'
-                    logger.warning("Nenhum %s detectado para salvar.", 'vale' if self._fiber_mode() == 'INT' else 'pico')
-                    QMessageBox.warning(self, "Atenção", f"Não há {feature_plural} detectados para salvar.")
-                    return
-            else:
-                roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
-                valleys = np.asarray(self.results_df['Vale'], dtype=np.float64)
-
-                mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
-
-                timestamps_filtered = timestamps[mask]
-                intensities_filtered = np.asarray(
-                    [intensities[i] for i in range(len(intensities)) if mask[i]],
-                    dtype=np.float32
-                )
-                resonant_filtered = valleys[mask]
-
-                if not timestamps_filtered.any():
-                    logger.warning("A região selecionada não contém dados para salvar.")
-                    QMessageBox.warning(self, "Atenção", "A região selecionada não contém dados para salvar.")
-                    return
-
+            self._save_active_channel_state()
             inter = self.config_data.get('inter')
+            current_state = self.channel_states.get(self.active_channel_idx, self._default_channel_state())
 
-            logger.debug(f"Salvando {len(intensities_filtered)} espectros")
+            save_entries: list[tuple[int | None, dict]] = []
+            if self._is_braggmeter() and isinstance(current_state.get('trace_states'), dict):
+                for trace_number in sorted(current_state['trace_states'].keys()):
+                    trace_state = current_state['trace_states'].get(trace_number)
+                    if trace_state is not None:
+                        save_entries.append((trace_number, trace_state))
+            else:
+                save_entries.append((None, current_state))
 
-            append_samples(
-                range_cfg=self.config_data.get('range'),
-                res=self.config_data.get('res'),
-                file_path=file_path,
-                inter=inter,
-                intensities=intensities_filtered,
-                timestamps=timestamps_filtered,
-                values=resonant_filtered,
-                sample_name=sample_name,
-                dataset_name=self._result_key(),
-            )
+            total_saved = 0
+            for trace_number, state in save_entries:
+                timestamps = np.asarray(state['Timestamp'], dtype=np.float64)
+                intensities = state['Intensidade']
+                trace_suffix = f" - Trace {trace_number}" if trace_number is not None else ""
+                sample_name_to_use = f"{sample_name}{trace_suffix}"
+
+                if self._fiber_mode() in ('FBG', 'INT'):
+                    peak_values = state['Picos']
+                    timestamps_filtered = timestamps
+                    intensities_filtered = np.asarray(intensities, dtype=np.float32)
+                    resonant_filtered = peak_values
+
+                    if not self._flatten_peak_values(peak_values):
+                        feature_plural = 'vales' if self._fiber_mode() == 'INT' else 'picos'
+                        logger.warning("Nenhum %s detectado para salvar.", 'vale' if self._fiber_mode() == 'INT' else 'pico')
+                        QMessageBox.warning(self, "Atenção", f"Não há {feature_plural} detectados para salvar.")
+                        continue
+                else:
+                    roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
+                    valleys = np.asarray(state['Vale'], dtype=np.float64)
+
+                    mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
+
+                    timestamps_filtered = timestamps[mask]
+                    intensities_filtered = np.asarray(
+                        [intensities[i] for i in range(len(intensities)) if mask[i]],
+                        dtype=np.float32
+                    )
+                    resonant_filtered = valleys[mask]
+
+                    if not timestamps_filtered.any():
+                        logger.warning("A região selecionada não contém dados para salvar.")
+                        QMessageBox.warning(self, "Atenção", "A região selecionada não contém dados para salvar.")
+                        continue
+
+                logger.debug(f"Salvando {len(intensities_filtered)} espectros{trace_suffix}")
+
+                append_samples(
+                    range_cfg=self.config_data.get('range'),
+                    res=self.config_data.get('res'),
+                    file_path=file_path,
+                    inter=inter,
+                    intensities=intensities_filtered,
+                    timestamps=timestamps_filtered,
+                    values=resonant_filtered,
+                    sample_name=sample_name_to_use,
+                    dataset_name=self._result_key(),
+                )
+
+                total_saved += len(timestamps_filtered)
+
+                if self._fiber_mode() in ('FBG', 'INT'):
+                    sample_peak_boxes = self._fbg_current_peak_samples(
+                        timestamps_filtered.tolist(),
+                        resonant_filtered,
+                        label_prefix="Pico" if self._fiber_mode() == 'FBG' else "Vale",
+                        feature_label="Pico" if self._fiber_mode() == 'FBG' else "Vale",
+                    )
+                    if sample_peak_boxes:
+                        self.samples[sample_name_to_use] = sample_peak_boxes
+                    else:
+                        resonant_for_box = self._from_meter(self._flatten_peak_values(resonant_filtered), self.resultUnit)
+                        self.samples[sample_name_to_use] = self.box_plot_statistics(resonant_for_box)
+                else:
+                    resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
+                    self.samples[sample_name_to_use] = self.box_plot_statistics(resonant_for_box)
+
+            if total_saved == 0:
+                return
 
             logger.info(f"Dados salvos com sucesso em: {file_path}")
-            QMessageBox.information(self, "Sucesso", f"{len(timestamps_filtered)} medições foram salvas com sucesso em:\n{file_path}")
+            QMessageBox.information(self, "Sucesso", f"{total_saved} medições foram salvas com sucesso em:\n{file_path}")
 
             # Armazena o caminho definido para futuro uso
             self.file_path = file_path
             self.setWindowTitle(f"Análise de dados - {os.path.basename(file_path)}")
-            # Calcula e armazena as estatísticas do box plot na escala configurada
-            if self._fiber_mode() in ('FBG', 'INT'):
-                sample_peak_boxes = self._fbg_current_peak_samples(
-                    timestamps_filtered.tolist(),
-                    resonant_filtered,
-                    label_prefix="Pico" if self._fiber_mode() == 'FBG' else "Vale",
-                    feature_label="Pico" if self._fiber_mode() == 'FBG' else "Vale",
-                )
-                if sample_peak_boxes:
-                    self.samples[sample_name] = sample_peak_boxes
-                else:
-                    # Fallback para manter compatibilidade caso não haja recorrência suficiente
-                    resonant_for_box = self._from_meter(self._flatten_peak_values(resonant_filtered), self.resultUnit)
-                    self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
-            else:
-                resonant_for_box = self._from_meter(resonant_filtered, self.resultUnit)
-                self.samples[sample_name] = self.box_plot_statistics(resonant_for_box)
             self.samples = dict(reversed(self.samples.items())) # Mantém a ordem de inserção (última amostra salva aparece primeiro)
             self._save_active_channel_state()
             self._save_persistent_settings()

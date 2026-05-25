@@ -8,8 +8,10 @@ from ui.AnalysisWindow import AnalysisWindow
 
 from serial.tools import list_ports
 from sys import argv
+import subprocess
 import qdarktheme
 import os
+import re
 
 class ConfigWindow(QMainWindow, Ui_ConfigWindow):
     """
@@ -65,7 +67,10 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.ch1_radio.toggled.connect(self.channel_toggled)
         self.start_btn.setShortcut('Return') # Atalho do teclado
 
-        for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]:
+        for trace_radio in [self.t_hlay.itemAt(i).widget() for i in range(self.t_hlay.count())]:
+            trace_radio.toggled.connect(self.trace_toggled)
+
+        for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]:
             ch.toggled.connect(self.channel_toggled)
 
         self.inter_combo.addItems(['IBSEN IMON-512', 'BRAGGMETER FS22DI', 'BRAGGMETER FS22DI HBM', 'THORLABS CCT11', 'THORLABS OSA203'])
@@ -99,6 +104,9 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.ch2_radio.setChecked(self.settings.value('config/ch2', self.ch2_radio.isChecked(), type=bool))
         self.ch3_radio.setChecked(self.settings.value('config/ch3', self.ch3_radio.isChecked(), type=bool))
         self.ch4_radio.setChecked(self.settings.value('config/ch4', self.ch4_radio.isChecked(), type=bool))
+        for t, val in enumerate(self.settings.value('config/bragg_traces', [True, False, False, False], type=list)):
+            if t < self.t_hlay.count():
+                self.t_hlay.itemAt(t).widget().setChecked(str(val).lower() == 'true')
         self.channel_toggled()
 
     def _apply_theme(self):
@@ -111,6 +119,16 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(qdarktheme.load_stylesheet(self.theme))
+
+    def _trace_radios(self):
+        return [self.t_hlay.itemAt(i).widget() for i in range(self.t_hlay.count())]
+
+    def _current_trace_selection(self):
+        return [radio.isChecked() for radio in self._trace_radios()]
+
+    def trace_toggled(self, *_):
+        if not any(self._current_trace_selection()):
+            self.t0_radio.setChecked(True)
 
     def _save_settings(self):
         """
@@ -129,14 +147,36 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.settings.setValue('config/ch3', self.ch3_radio.isChecked())
         self.settings.setValue('config/ch4', self.ch4_radio.isChecked())
         self.settings.setValue('config/theme', self.theme)
+        if 'BRAGGMETER' in self.inter_combo.currentText():
+            self.settings.setValue('config/bragg_traces', self._current_trace_selection())
         self.settings.sync()
+
+    def _get_ipv4_ethernet(self) -> list[str] | None:
+        """
+        Retorna o endereço IPv4 da interface Ethernet, se disponível.
+        """
+        cfg = subprocess.check_output('ipconfig', text=True, encoding='cp850')  # evita problemas de acentuação
+        linhas = cfg.splitlines()
+        section = False
+        for linha in linhas:
+            if not "Adaptador Ethernet Ethernet:" in linha and not section:
+                continue
+            section = True
+
+            # mídia desconectada
+            if "desconectada" in linha:
+                return None
+
+            # obtém IPv4
+            ip = re.search(r"IPv4.*?:\s*([\d\.]+)", linha)
+            if ip:
+                return ip.group(1).split('.')
 
     def start_analysis(self):
         """
         Inicia a janela de análise com as configurações selecionadas.
 
         """
-        QApplication.instance().setOverrideCursor(Qt.WaitCursor)
         cur_dir = os.path.dirname(os.path.abspath(argv[0]))
 
         inter = self.inter_combo.currentText()
@@ -169,16 +209,29 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             'path': self.file_path,
             'sdk': osa,
             'switch_ports': self.switch_ports,  # Lista de todas as portas de switch
-            'channels': (self.ch1_radio.isChecked(), self.ch2_radio.isChecked(), self.ch3_radio.isChecked(), self.ch4_radio.isChecked()),
+            'channels': [i.isChecked() for i in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]],
+            'bragg_traces': self._current_trace_selection(),
             'theme': self.theme,
         }
 
-        for x in config.get('ip').split('.'):
+        ip = self._get_ipv4_ethernet()
+        if not ip:
+            QMessageBox.warning(self, "Falha na conexão", "Cabo de rede não identificado, verifique a conexão Ethernet.")
+            return
+
+        user_ip = config.get('ip').split('.')
+        for x in user_ip:
             if not x.isdigit() or not 0 <= int(x) <= 255:
-                QMessageBox.warning(self, "IP inválido", "O endereço IP inserido não é válido.")
-                return 
+                QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não é válido.")
+                return
+            
+        for i in range(3):
+            if ip[i] != user_ip[i] or ip[3] == user_ip[3]:
+                QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não condiz com o IP da interface Ethernet.")
+                return
 
         self._save_settings()
+        QApplication.instance().setOverrideCursor(Qt.WaitCursor)
 
         if self.analysis_window is None:
             self.analysis_window = AnalysisWindow()
@@ -186,7 +239,8 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             self.analysis_window.setWindowIcon(QIcon(icon))
             self.analysis_window.closing.connect(lambda theme: self.on_analysis_window_closed(theme))
             self.analysis_window.load_config(config)
-            self.analysis_window.show()
+            self.analysis_window.showMaximized()
+            self.refreshTimer.stop()
             self.hide()
 
     def start_fft_analysis(self):
@@ -207,12 +261,12 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self._save_settings()
 
         if self.analysis_window is None:
-            self.analysis_window = FFTWindow()
+            # self.analysis_window = FFTWindow()
             icon = os.path.join(cur_dir, "img", "litel.png")
             self.analysis_window.setWindowIcon(QIcon(icon))
             self.analysis_window.closing.connect(lambda theme: self.on_analysis_window_closed(theme))
             self.analysis_window.load_config(config)
-            self.analysis_window.show()
+            self.analysis_window.showMaximized()
             self.hide()
 
     def on_analysis_window_closed(self, theme: str):
@@ -220,11 +274,13 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         Callback chamado quando a janela de análise é fechada.
 
         """
+        QApplication.instance().restoreOverrideCursor()
         self.analysis_window = None
         self.theme = theme
         self._apply_theme()
         self._save_settings()
         self.show()
+        self.refreshTimer.start(1000)
 
     def bragg(self):
         """
@@ -240,6 +296,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.ip_lbl.setEnabled(True)
         self.ip_lineEdit.setEnabled(True)
         self.startfft_btn.setEnabled(False)
+        self.setTraces(True)
 
     def thorlabs(self):
         """
@@ -253,6 +310,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         self.com_lbl.setEnabled(False)
         self.port_combo.setEnabled(False)
         self.startfft_btn.setEnabled(False)
+        self.setTraces(False)
 
     def setSpins(self, min: int, max: int, minVal: int = None, maxVal: int = None):
         """
@@ -270,6 +328,15 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         else:
             self.maxNm_spin.setValue(max)
 
+    def setTraces(self, state: bool):
+        """
+        Habilita ou desabilita os traces do BraggMeter.
+
+        """
+        for t in self._trace_radios():
+            t.setEnabled(state)
+        self.t_lbl.setEnabled(state)
+
     def set_port_options(self, inter: str):
         """
         Ajusta as opções de porta com base no tipo de interface selecionado (serial e TCP/IP).
@@ -282,6 +349,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
                 self.com_lbl.setEnabled(True)
                 self.setSpins(1510, 1595)
                 self.update_coms()
+                self.setTraces(False)
             case 'BRAGGMETER FS22DI':
                 self.bragg()
                 self.setSpins(1500, 1600)
@@ -302,7 +370,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         Habilita o botão de iniciar análise apenas se pelo menos um canal estiver selecionado.
 
         """
-        if any(ch.isChecked() for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]):
+        if any(ch.isChecked() for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]):
             self.start_btn.setEnabled(True)
         else:
             self.start_btn.setEnabled(False)
@@ -331,7 +399,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
                 for port in imon:
                     self.port_combo.addItem(port.device)
 
-        for ch in [self.ch1_radio, self.ch2_radio, self.ch3_radio, self.ch4_radio]:
+        for ch in [self.ch_hlay.itemAt(i).widget() for i in range(self.ch_hlay.count())]:
             ch.setEnabled(bool(switch))
             if not switch:
                 ch.setChecked(False)
