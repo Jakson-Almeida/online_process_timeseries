@@ -1,17 +1,3 @@
-# -*- coding: utf-8 -*-
-# -----------------------------------------------------------------------------
-# Autor: Felipe Oliveira Barino
-# Data: 03 de Junho de 2024
-#
-# Este script é fornecido "COMO ESTÁ", sem garantia de qualquer tipo, expressa ou
-# implícita. O autor não se responsabiliza por quaisquer danos diretos ou indiretos
-# resultantes do uso deste software. Use por sua conta e risco.
-#
-# Aviso de Reprodução:
-# A reprodução ou distribuição não autorizada deste código, ou de qualquer parte
-# dele, é estritamente proibida.
-# -----------------------------------------------------------------------------
-
 import numpy as np
 import logging
 import socket

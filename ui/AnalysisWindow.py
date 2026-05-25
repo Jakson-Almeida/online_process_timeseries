@@ -2663,7 +2663,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         Atualiza o box plot mesmo com a aquisição parada.
         
         """
-        self.channel_states[self.active_channel_idx]['temporal_roi_range'] = self.temporal_roi_region.getRegion()
+        temporal_roi = self.temporal_roi_region.getRegion()
+        channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
+        channel_state['temporal_roi_range'] = temporal_roi
+
+        if self._is_braggmeter():
+            trace_number = self._active_trace_number()
+            if trace_number is not None:
+                trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+                trace_state['temporal_roi_range'] = temporal_roi
 
         if self.timer is None or not self.timer.isActive():
             self._update_plots_with_results()
@@ -2672,8 +2680,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         roi_min, roi_max = self.roi_region.getRegion()
         self.roi_range = [roi_min, roi_max]
         self._save_roi_for_current_mode()
-        if self.active_channel_idx in self.channel_states:
-            self.channel_states[self.active_channel_idx]['roi_range'] = self.roi_range
+        channel_state = self.channel_states.setdefault(self.active_channel_idx, self._default_channel_state())
+        channel_state['roi_range'] = list(self.roi_range)
+
+        if self._is_braggmeter():
+            trace_number = self._active_trace_number()
+            if trace_number is not None:
+                trace_state = channel_state['trace_states'].setdefault(trace_number, self._default_trace_state(trace_number))
+                trace_state['roi_range'] = list(self.roi_range)
 
     def toggle_thread(self):
         """
@@ -3085,7 +3099,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.temporal_roi_region.setRegion((roi_min, roi_max))
                 logger.debug(f"ROI temporal ajustada no intervalo: {roi_min} a {roi_max}")
 
-            logger.debug("Gráfico FBG de evolução temporal atualizado.")
+            logger.debug("Gráfico de evolução temporal atualizado.")
 
             # Atualiza linhas verticais no gráfico de espectros para os últimos picos.
             # Remove apenas as linhas rastreadas em _peak_marker_lines, sem precisar
