@@ -48,6 +48,7 @@ class DataAcquisition(QObject):
         # Flags para modo contínuo (OSA203 com múltiplos canais)
         self._continuous_mode = False
         self._spectrum_averaging = 1
+        self._last_switch_channel: int | None = None
 
     def run(self):
         """
@@ -59,6 +60,7 @@ class DataAcquisition(QObject):
         """
         self._stopping = False
         self._paused = False
+        self._last_switch_channel = None
 
         if hasattr(self, 'device') and self.device is not None:
             self.stop()
@@ -115,6 +117,7 @@ class DataAcquisition(QObject):
         switch = self.switch
         self.device = None
         self.switch = None
+        self._last_switch_channel = None
 
         try:
             logger.info(f"Fechando conexão com {self.inter}.")
@@ -158,6 +161,13 @@ class DataAcquisition(QObject):
             return
 
         try:
+            is_bragg_with_switch = isinstance(device, BraggMeter) and switch is not None
+            channel_switched = (
+                is_bragg_with_switch
+                and self._last_switch_channel is not None
+                and self._last_switch_channel != channel
+            )
+
             if switch is not None:
                 # Em modo contínuo (OSA203), apenas sincroniza sem pausas
                 if self._continuous_mode:
@@ -200,9 +210,18 @@ class DataAcquisition(QObject):
                         if cur_channel == channel:
                             break
                         switch.set_channel(channel)
+                        time.sleep(0.05) # Pequena pausa para retry
 
                     if cur_channel != channel:
                         raise Exception(f"Falha ao configurar canal {channel} em todos os switches Sercalo.")
+
+            # Para BraggMeter com switch: ao alternar entre canais, descarta uma
+            # aquisição dummy imediatamente após o settle para evitar vazamento.
+            if channel_switched:
+                self._discard_bragg_post_switch_dummy(device, bragg_traces)
+
+            if switch is not None:
+                self._last_switch_channel = channel
 
             spectrum, warn = device.get_osa_trace(n_mean, bragg_traces)
             if spectrum is None:
@@ -228,6 +247,23 @@ class DataAcquisition(QObject):
             self.error_occurred.emit("Erro inesperado", str(e))
             self.stop()
             return
+
+    def _discard_bragg_post_switch_dummy(self, device: BraggMeter, bragg_traces: list[bool]):
+        """
+        Executa uma aquisição dummy após troca de canal do switch para BraggMeter.
+
+        A primeira leitura após chaveamento pode conter resquício do canal anterior,
+        por isso a leitura é descartada antes da aquisição efetiva.
+        """
+        if self._stopping or self._paused:
+            return
+
+        try:
+            device.get_osa_trace(1, bragg_traces)
+            logger.debug("Aquisição dummy do BraggMeter descartada após troca de canal do switch.")
+        except Exception as e:
+            # Não interrompe o ciclo por falha no dummy: tenta a leitura efetiva.
+            logger.warning(f"Falha ao descartar aquisição dummy do BraggMeter: {e}")
 
     def get_fast_traces(self, n: int):
         """

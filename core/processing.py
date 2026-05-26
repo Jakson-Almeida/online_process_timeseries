@@ -316,11 +316,29 @@ def preprocess_plot_data(y_values: np.ndarray, methods: dict, savgol_window_size
         savgol_window_size (int): Tamanho da janela para o filtro de Savitzky-Golay (deve ser ímpar).
         savgol_polyorder (int): Ordem do polinômio para o filtro de Savitzky-Golay.
         apodization (str | None): Nome do método de apodização a ser aplicado, ou None para não aplicar apodização.
-    
+
     """
     y_values = _apodize_plot_data(y_values, methods, apodization)
     if savgol_window_size > 0:
-        y_values = savgol_filter(y_values, savgol_window_size, savgol_polyorder)
+        # Valida que o tamanho da janela não excede o número de pontos
+        # window_length deve ser <= tamanho do sinal para usar interpolação
+        y_len = len(y_values)
+        effective_window_size = min(savgol_window_size, y_len)
+        
+        # Garante que a janela é ímpar
+        if effective_window_size > 0 and effective_window_size % 2 == 0:
+            effective_window_size -= 1
+        
+        # Garante que polyorder < window_length
+        effective_polyorder = min(savgol_polyorder, max(0, effective_window_size - 1))
+        
+        if effective_window_size > 0 and effective_polyorder >= 0:
+            try:
+                y_values = savgol_filter(y_values, effective_window_size, effective_polyorder)
+            except Exception as e:
+                logger.warning(f"Savitzky-Golay filter failed: {e}. Returning unfiltered data.")
+                # Retorna dados sem filtro se houver erro
+        
     return y_values
 
 def build_peak_track_fft(

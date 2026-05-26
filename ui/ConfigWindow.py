@@ -159,7 +159,7 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
         linhas = cfg.splitlines()
         section = False
         for linha in linhas:
-            if not "Adaptador Ethernet Ethernet:" in linha and not section:
+            if not "Adaptador Ethernet Ethernet" in linha and not section:
                 continue
             section = True
 
@@ -214,21 +214,22 @@ class ConfigWindow(QMainWindow, Ui_ConfigWindow):
             'theme': self.theme,
         }
 
-        ip = self._get_ipv4_ethernet()
-        if not ip:
-            QMessageBox.warning(self, "Falha na conexão", "Cabo de rede não identificado, verifique a conexão Ethernet.")
-            return
+        if self.ip_lineEdit.isEnabled():
+            ip = self._get_ipv4_ethernet()
+            if not ip:
+                QMessageBox.warning(self, "Falha na conexão", "Cabo de rede não identificado, verifique a conexão Ethernet.")
+                return
 
-        user_ip = config.get('ip').split('.')
-        for x in user_ip:
-            if not x.isdigit() or not 0 <= int(x) <= 255:
-                QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não é válido.")
-                return
-            
-        for i in range(3):
-            if ip[i] != user_ip[i] or ip[3] == user_ip[3]:
-                QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não condiz com o IP da interface Ethernet.")
-                return
+            user_ip = config.get('ip').split('.')
+            for x in user_ip:
+                if not x.isdigit() or not 0 <= int(x) <= 255:
+                    QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não é válido.")
+                    return
+                
+            for i in range(3):
+                if ip[i] != user_ip[i] or ip[3] == user_ip[3]:
+                    QMessageBox.warning(self, "IP inválido", "O endereço IP configurado não condiz com o IP da interface Ethernet.")
+                    return
 
         self._save_settings()
         QApplication.instance().setOverrideCursor(Qt.WaitCursor)

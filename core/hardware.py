@@ -77,7 +77,6 @@ class BraggMeter:
         self.sock = None
 
         self.open()
-        time.sleep(0.05)
         self.start()
         time.sleep(0.05)
 
@@ -109,7 +108,7 @@ class BraggMeter:
         for attempt in range(3):
             try:
                 if self.sock is not None:
-                    logger.debug('Closing existing socket before reopening.')
+                    # logger.debug('Closing existing socket before reopening.')
                     try:
                         self.sock.close()
                     except (socket.error, AttributeError):
@@ -119,7 +118,8 @@ class BraggMeter:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(self.timeout)
                 self.sock.connect((self.host, self.port))
-                logger.info(f'Successfully opened socket to {self.host}:{self.port}')
+                # logger.debug(f'Successfully opened socket to {self.host}:{self.port}')
+                time.sleep(0.05) # Small delay to ensure connection is fully established before sending commands
                 return
             except Exception as e:
                 self.sock = None
@@ -271,7 +271,6 @@ class BraggMeter:
                         if resp:
                             break
                         self.open()
-                        time.sleep(0.02)
                     else:
                         raise ConnectionError(f'No response received for trace{trace} after 5 attempts.')
 
@@ -279,9 +278,9 @@ class BraggMeter:
                     ack_idx = resp.find('ACK')
                     payload = resp[ack_idx+4:] if ack_idx != -1 else resp
                     payload = payload.strip().strip('\r\n')
+                    parts = payload.split(':') if payload else []
 
                     if self.legacy_cmds:
-                        parts = payload
                         pot = parts[-1] if parts else ''
                         # legacy pot is comma separated numeric values
                         trace_vals = re.findall(r'[-+]?[0-9]*\.?[0-9]+', pot)
@@ -292,7 +291,6 @@ class BraggMeter:
                             continue
                         wl_raw.append(np.linspace(1500, 1600, len(power_raw[-1])))
                     else:
-                        parts = payload.split(':')
                         if len(parts) < 2:
                             logger.debug('Incomplete response from BraggMeter (no data/wavelength part)')
                             return None, None
@@ -334,7 +332,7 @@ class BraggMeter:
                     warn_raw = bool(np.max(power_raw[-1]) == 4095) or warn_raw
                     
                     spec_count += 1
-                    time.sleep(0.02)
+                    time.sleep(0.02) # Small delay between measurements
 
                 trace_wavelengths.append(np.mean(wl_raw, axis=0))
                 trace_powers.append(np.mean(power_raw, axis=0))
@@ -547,7 +545,7 @@ class Imon512:
                     self.serial_port = None
 
                 self.serial_port = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1)
-                logger.info(f'Successfully opened port {self.port}')
+                logger.debug(f'Successfully opened port {self.port}')
                 return
             except Exception as e:
                 self.serial_port = None  # Garante que serial_port está None em caso de erro
@@ -1158,7 +1156,7 @@ class SercaloSwitch:
                     self.serial_port = None
 
                 self.serial_port = serial.Serial(port=self.port, baudrate=self.baudrate, timeout=1)
-                logger.info(f'Successfully opened port {self.port}')
+                logger.debug(f'Successfully opened port {self.port}')
                 return
             except Exception as e:
                 self.serial_port = None
@@ -1177,7 +1175,6 @@ class SercaloSwitch:
         try:
             full_command = f'{command}\r\n'
             self.serial_port.write(full_command.encode())
-            logger.debug(f'Sent command: {command}')
 
         except (serial.SerialException, AttributeError, OSError) as e:
             logger.error(f'Write failed on {self.port}: {e}. Retrying...')
@@ -1196,7 +1193,6 @@ class SercaloSwitch:
                     return -1
                 response = self.serial_port.readline().decode(errors="ignore").strip()
                 if response:
-                    logger.debug(f'Received response: {response}')
                     if ':ack' in response:
                         return True
                     elif ':nack' in response:
@@ -1235,8 +1231,6 @@ class SercaloSwitch:
                 response.append(self.serial_port.readline().decode(errors="ignore").strip())
                 if not response:
                     continue
-
-                logger.debug(f'Received response: {response}')
 
                 if ':ack' in response:
                     try:

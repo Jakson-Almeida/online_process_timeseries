@@ -2720,8 +2720,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self.stop_btn.setEnabled(True)
             raise
 
-
-
     def _flush_continuous_buffer(self, force: bool = False):
         """
         Salva em lote o buffer do modo contínuo para reduzir overhead de I/O.
@@ -2804,7 +2802,25 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
 
         QApplication.instance().restoreOverrideCursor()
         self.stop_btn.setEnabled(True)
-        if not (self._is_braggmeter() and isinstance(warning, list)):
+        def _is_bragg_trace_collection(payload) -> bool:
+            if not self._is_braggmeter() or not isinstance(payload, (list, tuple)) or not payload:
+                return False
+
+            first_item = payload[0]
+            if isinstance(first_item, (list, tuple)) and len(first_item) == 2:
+                return not (
+                    np.isscalar(first_item[0])
+                    and np.isscalar(first_item[1])
+                )
+
+            if isinstance(first_item, np.ndarray):
+                return first_item.ndim >= 2 or (first_item.ndim == 1 and first_item.size != 2)
+
+            return False
+
+        is_bragg_trace_collection = _is_bragg_trace_collection(data)
+
+        if not (is_bragg_trace_collection and isinstance(warning, list)):
             self._show_warning(warning, channel)
 
         target_idx = self._channel_index_from_number(channel)
@@ -2820,7 +2836,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             self._save_active_channel_state()
             self._restore_channel_state(target_idx, trace=visible_trace)
 
-        if self._is_braggmeter() and isinstance(data, list):
+        if is_bragg_trace_collection:
             active_traces = self._active_bragg_traces()
             warning_items = warning if isinstance(warning, list) else [warning] * len(data)
             trace_payloads = []
@@ -3001,10 +3017,9 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 self.pending_hdf5['Picos'].append(peak_values)
                 self._flush_continuous_buffer()
 
-            if update_views and len(self.results_df['Timestamp']) < 3:
+            if update_views and len(self.results_df['Timestamp']) <= 1:
                 self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
             logger.debug(f"Processamento {fiber_type} concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
-            logger.debug(f"Último conjunto detectado ({'vales' if fiber_type == 'INT' else 'picos'}): {peak_values}")
         else: # LPG
             # 2. Obtém os limites da ROI selecionada pelo usuário
             roi_min, roi_max = self.roi_region.getRegion()
@@ -3019,7 +3034,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             # 4. Adiciona o resultado ao dicionário se um pico for encontrado
             if res_wl is not None:
                 res_wl = float(res_wl)
-                if len(self.results_df['Timestamp']) < 3:
+                if len(self.results_df['Timestamp']) <= 1:
                      self.spectraPlotWidget.autoRange() # Ajusta o zoom na primeira aquisição
 
                 self.results_df['Timestamp'].append(now)
@@ -3043,7 +3058,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     logger.debug(f"Dado salvo automaticamente")
 
             logger.debug(f"Processamento concluído. Total de {len(self.results_df['Timestamp'])} medições acumuladas.")
-            logger.debug(f"Último pico detectado: {locals().get('res_wl')} m, Total de medições: {len(self.results_df['Timestamp'])}")
 
         # 5. Chama a função para atualizar os gráficos com os resultados
         if update_views:
@@ -3097,7 +3111,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                 roi_min = timestamps_numeric[0]
                 roi_max = timestamps_numeric[-1]
                 self.temporal_roi_region.setRegion((roi_min, roi_max))
-                logger.debug(f"ROI temporal ajustada no intervalo: {roi_min} a {roi_max}")
 
             logger.debug("Gráfico de evolução temporal atualizado.")
 
@@ -3164,7 +3177,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             roi_min = timestamps_numeric[0] # Primeiro timestamp
             roi_max = timestamps_numeric[-1] # Último timestamp
             self.temporal_roi_region.setRegion((roi_min, roi_max)) # Ajusta a ROI temporal
-            logger.debug(f"ROI temporal ajustada no intervalo: {roi_min} a {roi_max}")
 
         logger.debug("Gráfico de evolução temporal atualizado.")
 
@@ -3183,7 +3195,6 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         )
         self.spectraPlotWidget.addItem(line)
         self._peak_marker_lines.append(line)
-        logger.debug(f"Marcador de pico adicionado ao gráfico de espectros.")
 
         # Seleciona a ROI temporal atual para filtrar os dados computados pelo box plot
         roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
