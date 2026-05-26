@@ -243,7 +243,11 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         self.actionLight.triggered.connect(lambda: self.set_theme('light'))
         self.actionDark.triggered.connect(lambda: self.set_theme('dark'))
         self.actionHelp.triggered.connect(lambda: webbrowser.open(
-            'https://github.com/pedroproprio/online_process_timeseries/blob/main/README.md'))
+            'https://github.com/pedroproprio/online_process_timeseries/'))
+        self.actionImon.triggered.connect(lambda: webbrowser.open(
+            'https://ftdichip.com/drivers/'))
+        self.actionSwitch.triggered.connect(lambda: webbrowser.open(
+            'https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads'))
         self.actionOpenFile.triggered.connect(self.open_file)
         self.actionNewWindow.triggered.connect(self.open_new_window)
 
@@ -984,7 +988,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         w = 'picos' if is_fbg else 'vales'
         self.actionPeaks.setText(f'Encontrar {w}')
         self.roi_region.setVisible(not is_fbg)
-        self.temporal_roi_region.setVisible(not is_fbg)
+        self.temporal_roi_region.setVisible(True)
         if is_peak_mode:
             self.roi_range = None
             self._clear_fbg_peak_colors()  # Limpa mapa de cores ao mudar para modo com séries recorrentes

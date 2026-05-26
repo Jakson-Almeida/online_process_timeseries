@@ -2271,7 +2271,16 @@
     <property name="title">
      <string>Ajuda</string>
     </property>
+    <widget class="QMenu" name="menuDrivers">
+     <property name="title">
+      <string>Drivers</string>
+     </property>
+     <addaction name="actionImon"/>
+     <addaction name="actionSwitch"/>
+    </widget>
     <addaction name="actionHelp"/>
+    <addaction name="separator"/>
+    <addaction name="menuDrivers"/>
    </widget>
    <widget class="QMenu" name="menuConfigura_es">
     <property name="title">
@@ -2375,6 +2384,16 @@
   <action name="actionPeaks">
    <property name="text">
     <string>Encontrar picos</string>
+   </property>
+  </action>
+  <action name="actionImon">
+   <property name="text">
+    <string>IBSEN IMON-512</string>
+   </property>
+  </action>
+  <action name="actionSwitch">
+   <property name="text">
+    <string>Sercalo Switch</string>
    </property>
   </action>
  </widget>
