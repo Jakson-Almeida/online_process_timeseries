@@ -1,3 +1,6 @@
+import logging
+logging.getLogger("pyOSA").disabled = True
+
 from pyOSA.constants import constants
 from pyOSA.units import units
 from pyOSA.FTSLib import FTSLib

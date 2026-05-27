@@ -68,6 +68,10 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Rastreador de cores para picos FBG: mapeia wavelength (em metros) para cor
         # Garante que o mesmo pico mantém a mesma cor ao longo do tempo
         self.fbg_peak_color_map: dict[float, tuple] = {}
+        # Passo espectral (em metros por ponto) observado no último processamento.
+        # Usado para converter corretamente o parâmetro de distância (em pontos)
+        # em tolerância de agrupamento/cores (em metros).
+        self._last_peak_step_m: float | None = None
         # Número máximo de entradas no mapa de cores; evita crescimento ilimitado
         # com drift de picos ao longo de horas de operação.
         self._MAX_PEAK_COLORS: int = 64
@@ -750,26 +754,46 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
             float: a tolerância (em metros) para associar picos FBG entre medições.
         
         """
-        res_m = self.config_data.get('res') if self.config_data else None
-        if res_m is None:
-            return 0.0
-        return float(self.peak_detection_params['distance']) * float(res_m)
+        step_m = None
+        if self._last_peak_step_m is not None and self._last_peak_step_m > 0:
+            step_m = float(self._last_peak_step_m)
+        elif self.config_data and self.config_data.get('res') is not None:
+            try:
+                cfg_res = abs(float(self.config_data.get('res')))
+                if cfg_res > 0:
+                    step_m = cfg_res
+            except (TypeError, ValueError):
+                step_m = None
 
-    def _find_matching_peak_key(self, peak_map: dict, wavelength: float) -> float | None:
+        if step_m is None:
+            return 0.0
+
+        distance_pts = max(1, int(self.peak_detection_params.get('distance', 1)))
+        return float(distance_pts) * step_m
+
+    def _find_matching_peak_key(self, peak_map: dict, wavelength: float, excluded_keys: set | None = None) -> float | None:
         """
         Busca uma chave existente no mapa de picos dentro da tolerância configurada.
         Args:
             peak_map (dict): Dicionário onde as chaves são os wavelengths de referência dos picos.
             wavelength (float): O comprimento de onda do pico a ser associado.
+            excluded_keys (set | None): Conjunto de chaves que não podem ser reutilizadas
+                na associação atual.
         Returns:
             float | None: O comprimento de onda da chave correspondente encontrada, ou None se não houver correspondência dentro da tolerância.
             
         """
         tolerance = self._fbg_peak_match_tolerance_m()
+        best_key: float | None = None
+        best_delta = np.inf
         for existing_wl in peak_map.keys():
-            if abs(existing_wl - wavelength) <= tolerance:
-                return existing_wl
-        return None
+            if excluded_keys is not None and existing_wl in excluded_keys:
+                continue
+            delta = abs(existing_wl - wavelength)
+            if delta <= tolerance and delta < best_delta:
+                best_delta = delta
+                best_key = existing_wl
+        return best_key
 
     def _group_fbg_peak_series(self, timestamps: list[float], peak_series: list[list[float]]) -> dict[float, list[tuple[float, float]]]:
         """
@@ -784,13 +808,19 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         grouped: dict[float, list[tuple[float, float]]] = {}
 
         for timestamp, peaks in zip(timestamps, peak_series):
+            used_keys_in_timestamp: set[float] = set()
             for peak_wavelength in sorted(peaks):
                 peak_wavelength = float(peak_wavelength)
-                match_key = self._find_matching_peak_key(grouped, peak_wavelength)
+                match_key = self._find_matching_peak_key(
+                    grouped,
+                    peak_wavelength,
+                    excluded_keys=used_keys_in_timestamp,
+                )
                 if match_key is None:
                     match_key = peak_wavelength
                     grouped[match_key] = []
                 grouped[match_key].append((float(timestamp), peak_wavelength))
+                used_keys_in_timestamp.add(match_key)
 
         return dict(sorted(grouped.items(), key=lambda item: item[0]))
 
@@ -2961,6 +2991,14 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         # Wavelength em metros para o processamento
         display_to_m = self._unit_to_meter_factor(self.xUnit)
         wavelength *= display_to_m
+
+        if wavelength.size >= 2:
+            diffs = np.diff(wavelength)
+            diffs = diffs[np.isfinite(diffs)]
+            if diffs.size > 0:
+                step_m = float(np.median(np.abs(diffs)))
+                if step_m > 0:
+                    self._last_peak_step_m = step_m
 
         interp_fn = interp1d(
             wavelength,
