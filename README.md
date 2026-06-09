@@ -6,9 +6,9 @@ Desenvolvido pela **LiTel**, o programa lê os espectros de luz captados por equ
 
 ---
 
-## Para que serve?
+## Sobre o software
 
-Imagine um sensor preso a uma estrutura ou colocado em um ambiente controlado. Conforme algo muda — a temperatura sobe, uma peça se deforma, um líquido evapora — o padrão de luz medido pelo equipamento também muda. Este software:
+Este software:
 
 - **Conecta-se** ao aparelho de leitura (interrogador ou analisador de espectro)
 - **Captura** leituras de luz de forma contínua ou sob demanda
