@@ -621,6 +621,15 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
         """
         return {'Timestamp': [], 'Intensidade': [], 'Vale': [], 'Picos': []}
 
+    def _results_data_from_state(self, state: dict) -> dict:
+        """
+        Returns:
+            dict: store de resultados (Timestamp, Intensidade, Vale, Picos) a partir de um snapshot de canal/trace.
+        """
+        if 'results_df' in state:
+            return state['results_df']
+        return state
+
     def _fiber_mode(self) -> str:
         """
         Returns:
@@ -3453,17 +3462,26 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                     if trace_state is not None:
                         save_entries.append((trace_number, trace_state))
             else:
-                save_entries.append((None, current_state))
+                trace_number = current_state.get('in_view_trace')
+                if trace_number is None:
+                    trace_number = 0
+                trace_states = current_state.get('trace_states') or {}
+                trace_state = trace_states.get(trace_number)
+                save_entries.append((None, trace_state if trace_state is not None else current_state))
 
             total_saved = 0
             for trace_number, state in save_entries:
-                timestamps = np.asarray(state['Timestamp'], dtype=np.float64)
-                intensities = state['Intensidade']
+                data = self._results_data_from_state(state)
+                if not data.get('Timestamp'):
+                    continue
+
+                timestamps = np.asarray(data['Timestamp'], dtype=np.float64)
+                intensities = data['Intensidade']
                 trace_suffix = f" - Trace {trace_number}" if trace_number is not None else ""
                 sample_name_to_use = f"{sample_name}{trace_suffix}"
 
                 if self._fiber_mode() in ('FBG', 'INT'):
-                    peak_values = state['Picos']
+                    peak_values = data['Picos']
                     timestamps_filtered = timestamps
                     intensities_filtered = np.asarray(intensities, dtype=np.float32)
                     resonant_filtered = peak_values
@@ -3475,7 +3493,7 @@ class AnalysisWindow(QMainWindow, Ui_AnalysisWindow):
                         continue
                 else:
                     roi_min_ts, roi_max_ts = self.temporal_roi_region.getRegion()
-                    valleys = np.asarray(state['Vale'], dtype=np.float64)
+                    valleys = np.asarray(data['Vale'], dtype=np.float64)
 
                     mask = (timestamps >= roi_min_ts) & (timestamps <= roi_max_ts)
 
